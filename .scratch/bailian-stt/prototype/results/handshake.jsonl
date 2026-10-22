@@ -1,3 +1,0 @@
-{"t": null, "since_connect": 0.0, "kind": "note", "note": "run-task → task-started → finish-task，不发音频", "params": {"vad_model": "near_meeting_16k", "language_hints": ["zh", "ja"], "_finish_now": true}}
-{"t": null, "since_connect": 0.328, "kind": "task-started", "header": {"task_id": "f624d9bea2254aeebb407aa6da8cbd22", "event": "task-started", "attributes": {}}, "payload": {}}
-{"t": null, "since_connect": 0.375, "kind": "task-finished", "header": {"task_id": "f624d9bea2254aeebb407aa6da8cbd22", "event": "task-finished", "attributes": {}}, "payload": {"output": {}}}

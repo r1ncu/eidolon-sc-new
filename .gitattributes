@@ -1,7 +1,0 @@
-# 文本文件在仓库和工作区里一律是 LF，不随本机的 core.autocrlf 转成 CRLF：
-# agent 和生成器写的都是 LF，检出成 CRLF 后每次 diff 都报 "LF will be replaced by CRLF"
-* text=auto eol=lf
-# cmd.exe 读只有 LF 的批处理文件时 goto/call 标签会错位
-*.cmd text eol=crlf
-# Spine runtime 原样保存（ADR-0009），换行符转换会改变校验和
-frontend/public/vendor/spine-3.6/** -text

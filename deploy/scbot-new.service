@@ -1,0 +1,32 @@
+[Unit]
+Description=scbot-new: a plugin-kernel chat server
+Documentation=https://github.com/Sallyn0225/eidolon-sc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scbot
+Group=scbot
+WorkingDirectory=/opt/scbot-new
+Environment=PYTHONUNBUFFERED=1
+# 库与图片：systemd 会建好这两个目录。
+StateDirectory=scbot
+Environment=SCCORE_DB=/var/lib/scbot/scbot.db
+Environment=SCCORE_MEDIA=/var/lib/scbot/media
+ExecStart=/usr/bin/env python3 serve.py
+Restart=always
+RestartSec=3
+# 一轮回复可能写两三分钟，别在半路把它杀掉。
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# 只有它自己需要写这两个目录。
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/scbot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,0 @@
-{"t": null, "since_connect": 0.0, "kind": "note", "note": "task-started 后一包都不发，等服务端断开", "params": {"vad_model": "near_meeting_16k", "language_hints": ["zh", "ja"]}}
-{"t": null, "since_connect": 0.297, "kind": "task-started", "header": {"task_id": "799ef31955684972a4044e306164092f", "event": "task-started", "attributes": {}}, "payload": {}}
-{"t": 23.0, "since_connect": 23.297, "kind": "task-failed", "header": {"task_id": "799ef31955684972a4044e306164092f", "event": "task-failed", "error_code": "CLIENT_ERROR", "error_message": "request timeout after 23 seconds.", "attributes": {}}, "payload": {}}
