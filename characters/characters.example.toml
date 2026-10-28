@@ -1,0 +1,53 @@
+# 角色表 —— 复制成 characters.toml，改成你自己的人。
+#
+#   cp characters/characters.example.toml characters/characters.toml
+#
+# 下面三个角色是编的，只用来演示字段。字段的完整说明见 characters/README.md；
+# 这里没写的字段都有默认值，最省事的一条角色只要 id、name、color、sheet。
+
+[[characters]]
+id = "aoi"
+name = "青井 澪"
+name_zh = "青井澪"
+name_kana = "あおい みお"
+name_romaji = "Aoi Mio"
+# 一句话介绍：对话列表里显示，也会进提示词。
+intro = "示例角色：二十七岁，剧场的技术主管。话少，笑起来才看得出年纪。"
+color = "#7fb3d5"
+# 人设正文，相对本目录。文件不存在时用一段占位文字，不会报错。
+sheet = "sheets/aoi.md"
+avatar = "avatars/aoi.jpg"
+
+# ---- 恋爱系统的三个数（都不写也能跑，走默认）----
+# adult 是**学段**不是民法成年：高中及以上 true，初中・小学 false；
+# 不写 = 没人填过 = 按未成年（保守，漏判一个未成年的代价更大）。
+age = 27
+adult = true
+# plove 0–5：她会不会往那个方向走。0 = 没有这条线（不进恋爱，也不进暧昧）。
+plove = 4
+# heavy 1–5：「重」只有强度没有方向。方向写在她的人设里，不在这里。
+heavy = 3
+
+[[characters]]
+id = "nagi"
+name = "凪 さや"
+name_zh = "凪沙耶"
+intro = "示例角色：高二，合唱部。怕生，但一站上台就不抖。"
+color = "#a5d6a7"
+sheet = "sheets/nagi.md"
+age = 17
+adult = true   # 高中生：学段上算「过线」，与民法成年无关
+plove = 3
+heavy = 2
+
+[[characters]]
+id = "yuki"
+name = "雪村 ゆき"
+name_zh = "雪村雪"
+intro = "示例角色：初三，话多，觉得自己已经长大了。"
+color = "#ffe082"
+sheet = "sheets/yuki.md"
+age = 14
+adult = false  # 初中生：天花板是「暧昧」，告白只会被温柔地挡回去
+plove = 3
+heavy = 3

@@ -1,0 +1,75 @@
+# 一个群、一个她。两个容器：对话的内核，和一台登录着 QQ 小号的 NapCat。
+#
+#   cp .env.example .env    → 填 CHAT_LLM_* 与 QQ_*（还有 NAPCAT_WEBUI_TOKEN）
+#   docker compose up -d --build
+#   docker compose logs -f scbot
+#
+# 只有网页端（8100）和 NapCat 的 WebUI（6099）发布到宿主机，而且都只绑 127.0.0.1：
+# 网页用 SSH 隧道看，WebUI 用来扫码登录。OneBot 的 3001 不对外，只在 compose 网络里。
+
+services:
+  scbot:
+    build: .
+    image: scbot-new:1.4.3
+    container_name: scbot
+    restart: unless-stopped
+    # asyncio 启动时要建一个 socketpair（self-pipe）。在某些宿主机上（PVE + AppArmor 的
+    # 默认 docker profile 就会），它被拒绝成 PermissionError，于是每一个 HTTP 请求都 500。
+    # 与权限无关，是启动条件；干净的 python:3.11-slim 在没有这一行时同样起不来。
+    security_opt:
+      - apparmor=unconfined
+    env_file: .env
+    environment:
+      # 容器内的固定形状：监听全网卡、数据在卷里、OneBot 走服务名。
+      SCCORE_HOST: 0.0.0.0
+      SCCORE_PORT: "8100"
+      SCCORE_DB: /data/scbot.db
+      SCCORE_MEDIA: /data/media
+      QQ_ONEBOT_WS: ws://napcat:3001
+    volumes:
+      - scbot-data:/data
+      # 人设与规则是数据，不是代码：挂在外面才改得动。改完下一轮就生效（见 DEPLOY.md），
+      # 不需要重建镜像——重建镜像也只会把镜像里那份旧文本再盖回来一次。
+      - ./characters:/app/characters
+    ports:
+      - "127.0.0.1:8100:8100"
+    depends_on:
+      - napcat
+    networks:
+      - scbot
+
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: scbot-napcat
+    restart: unless-stopped
+    # QQ NT 在默认的 seccomp/AppArmor 配置下会 SIGTRAP 崩溃（日志：Trace/breakpoint trap）。
+    # 这两条不是「为了权限」加的，是让它在容器里能正常启动的最小让步。
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    # Chromium 内核的默认 /dev/shm 只有 64M，登录后扫码页会白屏。
+    shm_size: 256m
+    environment:
+      MODE: ws
+      WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:?在 .env 里设一个 NAPCAT_WEBUI_TOKEN}
+      # 有了它，容器启动时执行 `qq -q <号>` 快速登录，重启不用再扫码。
+      # 没登录过时这个号会被忽略，还是出二维码。
+      ACCOUNT: ${QQ_SELF_ID:-}
+      TZ: Asia/Shanghai
+    volumes:
+      - napcat-qq:/app/.config/QQ
+      - napcat-config:/app/napcat/config
+      - napcat-plugins:/app/napcat/plugins
+    ports:
+      - "127.0.0.1:6099:6099"
+    networks:
+      - scbot
+
+volumes:
+  scbot-data:
+  napcat-qq:
+  napcat-config:
+  napcat-plugins:
+
+networks:
+  scbot:

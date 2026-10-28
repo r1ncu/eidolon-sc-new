@@ -1,0 +1,18 @@
+# 组合表 —— 复制成 units.toml 再改。
+#
+#   cp characters/units.example.toml characters/units.toml
+#
+# 只影响两件事：对话列表的筛选面板怎么分组、搜索时能不能用组名和读音找到人。
+# 没有这个文件，所有角色的 unit 都是空——面板不分组，其余功能不受影响。
+#
+# 一位角色按 id 归到一个组合；没列进来的角色 unit 为空。顺序就是面板里的顺序。
+
+[[units]]
+name = "示例组合 A"
+reading = "れいぐみえー"   # 平假名读音，搜索用；可以留空
+members = ["aoi"]
+
+[[units]]
+name = "示例组合 B"
+reading = "れいぐみびー"
+members = ["nagi", "yuki"]

@@ -1,0 +1,18 @@
+# 镜像里不需要的东西：密钥、本地数据、测试、开发工具。
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+data/
+media/
+__pycache__/
+*.pyc
+tests/
+tools/
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+DEPLOY.md
