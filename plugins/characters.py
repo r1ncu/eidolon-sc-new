@@ -12,6 +12,7 @@ that there are twenty-eight of them or that a colour exists. Without this plugin
 server still talks to one character, from `SCCORE_CHARACTERS`' first `*.md`.
 """
 
+import re
 import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -127,7 +128,11 @@ class Characters(Plugin):
         self._units = _read_units(self._root)
         self._all: tuple[Character, ...] = _load(self._root, self._config, self._units)
         if not self._all:
-            raise RuntimeError(f"{self._root} 里没有角色（characters.toml 或 *.md）")
+            raise RuntimeError(
+                f"{self._root} 里没有角色。先建一个角色表：\n"
+                f"  cp {self._root}/characters.example.toml {self._root}/characters.toml\n"
+                "然后把它改成你自己的人——字段说明见 characters/README.md。"
+            )
         self._by_id = {character.id: character for character in self._all}
         self._paths = _sheet_paths(self._root, self._config)
         self._stamp = self._signature()
@@ -357,10 +362,23 @@ def _sheet_paths(root: Path, config: Path) -> dict[str, Path]:
     return paths
 
 
+_NOT_A_CHARACTER = re.compile(
+    r"^(readme|changelog|contributing|license|index|example.*|.*\\.example)$", re.I
+)
+"""Files that sit next to the sheets but are not one.
+
+A directory that ships with a `README.md` used to wake up with a character called 「README」:
+a bare deployment looked like it had somebody in it, and the 「no characters」 error — the one
+that tells you to copy the example — never fired."""
+
 def _from_sheets(root: Path) -> tuple[Character, ...]:
     """No `characters.toml`: every `*.md` is a character, named by its heading. This is
     what a bare directory — a test, a demo, a half-copied deployment — still gives you."""
-    files = sorted(root.glob("*.md")) or sorted((root / SHEETS).glob("*.md"))
+    files = [
+        file
+        for file in (sorted(root.glob("*.md")) or sorted((root / SHEETS).glob("*.md")))
+        if not _NOT_A_CHARACTER.match(file.stem) and not file.name.startswith(".")
+    ]
     return tuple(
         Character(
             id=file.stem,
