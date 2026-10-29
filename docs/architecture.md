@@ -1642,7 +1642,7 @@ python3 serve.py --fake --port 8100
 | `SCCORE_TURNS_PER_HOUR` | 60 | 每人每小时的回合上限 |
 | `SCCORE_PHOTOS_PER_HOUR` | 8 | 每人每小时能发几张图 |
 | `SCCORE_HISTORY_TURNS` | 20 | 提示词里保留几轮（0 = 全部） |
-| `SCCORE_TIMEZONE` | `Asia/Shanghai` | 日界所在时区（记忆、额度、周几） |
+| `SCCORE_TIMEZONE` | `Asia/Tokyo` | 日界所在时区（记忆、额度、空间日历、作息）——**她的钟是日本时间**：她是日本人，「深夜」「该睡了」都按这个算 |
 | `SCCORE_AFFINITY_START` | 20 | **群聊**陌生人起步好感度（网页/私聊是 50） |
 | `SCCORE_RECALL` | `off` | `off` / `whole` / `vector` |
 | `SCCORE_RECALL_TOP` / `_MIN` / `_GATE` | 4 / 0.35 / `off` | 只 vector 模式有用 |
@@ -1887,7 +1887,7 @@ compose 里已经有 `security_opt: apparmor=unconfined`，`napcat` 还有 `secc
 ### 11.2 时间与时区
 
 - 数据库里所有时间戳是 **UTC**（`+00:00`）。「今天」「周几」「零点」的判断
-  全部按 `SCCORE_TIMEZONE`（默认 `Asia/Shanghai`）算。
+  全部按 `SCCORE_TIMEZONE`（默认 `Asia/Tokyo`，日本时间）算。
 - 容器里必须有 `tzdata`，否则 `ZoneInfo("Asia/Shanghai")` 失败，退回 UTC 偏移，
   于是「早上九点的表情」会在错误的时间发。
 - 定时任务的判断都是「过了这个点之后」而不是「正好这个点」，所以一次 tick 的延迟

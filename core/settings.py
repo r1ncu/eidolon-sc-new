@@ -23,7 +23,7 @@ DEFAULTS = {
     "SCCORE_PHOTOS_PER_HOUR": "8",
     "SCCORE_HISTORY_TURNS": "20",
     "SCCORE_VOICED_BY": "",
-    "SCCORE_TIMEZONE": "Asia/Shanghai",
+    "SCCORE_TIMEZONE": "Asia/Tokyo",
     "SCCORE_RECALL": "off",
     "SCCORE_RECALL_TOP": "4",
     "SCCORE_RECALL_MIN": "0.35",
@@ -92,9 +92,11 @@ class Settings:
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     fish_key: str = ""
     fish_base_url: str = ""
-    timezone: str = "Asia/Shanghai"
-    """The zone the day begins in for memories and draw chances: upstream keeps everyone on
-    Beijing's days, whatever their own zone. Only the extraction prompt's date uses it."""
+    timezone: str = "Asia/Tokyo"
+    """她的一天从哪一点开始：记忆、额度、空间日历、群里的作息，全按这个时区。
+
+    默认日本（UTC+9），因为**她是日本人**——她的「深夜」「早上」「该睡了」都是日本时间，
+    顺着部署地算等于让她活在中国时间里。她不需要知道群里的钟怎么走。"""
 
     @classmethod
     def from_env(

@@ -88,7 +88,6 @@ vi .env
 | `IMAGE_API_KIND` | `fake` | `fake` 不联网（出一块纯色图，用来验链路）；`openai` 走真的生图服务 |
 | `IMAGE_API_BASE` / `IMAGE_API_KEY` / `IMAGE_MODEL` | 空 | 真的生图服务用的三项（`openai` 模式要齐） |
 | `QQ_IMAGE_HOURLY` | `6` | 一小时最多发几张图（`0` = 不限） |
-| `QQ_REST_TZ` | `Asia/Tokyo` | 作息按哪个时区算（她是日本人）。只影响作息，不影响额度与空间 |
 | `QQ_HOLIDAYS` / `QQ_WORKDAYS` | 空 | 日历纠正（`YYYY-MM-DD`）：这些天按休息日 / 上班算。只影响她**主动开口**的时段，不影响 @ 和私聊 |
 | `QQ_BOTS` | 空 | 别的角色的机器人：`号码=角色id`（如 `3824843517=luca`）。她据此按「认识的人」而不是陌生人接话 |
 | `QQ_PRIVATE` / `QQ_PRIVATE_IDS` | 想先一对一测就把 `QQ_PRIVATE=1`，名单填你的号；私聊里没有外人，她用平时的语气（不是「ふゆ」） |

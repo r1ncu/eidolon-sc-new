@@ -719,7 +719,7 @@ class QQChannel:
         Only answers one question — 「主动开口要不要闭嘴」。有人叫她就照回，只是语气不一样
         （见 `_night_note`）：一条 @ 在凌晨被吞掉，比被吵醒更像坏掉。
         """
-        local = _local_time(now or self._clock(), self.config.rest_tz)
+        local = _local_time(now or self._clock(), self.app.settings.timezone)
         day = local.strftime("%Y-%m-%d")
         off = day in self.config.holidays or (
             local.weekday() >= 5 and day not in self.config.workdays
@@ -735,7 +735,7 @@ class QQChannel:
         which one has to be the last, because 「她会不会自己结束」 is not something a
         character can decide consistently across six turns without being told.
         """
-        when = _local_time(self._clock(), self.config.rest_tz)
+        when = _local_time(self._clock(), self.app.settings.timezone)
         band = tier_of(value)
         if band in ("close", "intimate"):
             how = NIGHT_CLOSE
@@ -802,7 +802,7 @@ class QQChannel:
         """
         if owner:
             return True, 0, 0
-        local = _local_time(self._clock(), self.config.rest_tz)
+        local = _local_time(self._clock(), self.app.settings.timezone)
         window, _wake = self._rest_window(local)
         key = f"rest:{scope}:{qq_id}"
         state = self._rest_state(key)
