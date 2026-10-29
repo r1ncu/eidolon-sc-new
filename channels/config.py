@@ -22,6 +22,12 @@ class QQConfig:
     private: bool = False
     private_ids: tuple[str, ...] = ()
     ignore: tuple[str, ...] = ()
+    bots: tuple[tuple[str, str], ...] = ()
+    """哪些 QQ 号是别的角色的机器人：`QQ_BOTS=3824843517=luca`（号码=角色 id，逗号分隔）。
+
+    它们是**另一个角色**在说话，不是制作人也不是路人。标出来以后，她在这几个号说话时会
+    被告知「这是〇〇的机器人」，语气按认识的人走；不标的话，一段ルカ的台词会被她当成
+    一位陌生群友的寒暄来接。"""
     character: str = ""
     """谁在说话：`characters/characters.toml` 里的 id，也决定了 `characters/world/<id>-qq.md`
     和 `<id>-dm.md` 这两个文件叫什么。没有默认值——猜一个角色名字，猜错了她不会报错，
@@ -47,11 +53,14 @@ class QQConfig:
     ambient_sticker_p: float = 0.3
     ambient_own_p: float = 0.35
     ambient_daily: int = 10
-    """一天最多主动插话几次，所有群加在一起（0 = 不限）。
+    """**每个群**一天最多主动插话几次（0 = 不限）。
 
     概率管不住频率：群里一分钟十条消息，5% 就是每十几条一次，一天下来一百多次。
     「不多不少」是一个**次数**，不是一个概率，所以这里按天封顶。它管的是上限——
-    真正决定说不说下面那一句的，是「这个话题她有没有话接」（`channels/interests.py`）。"""
+    真正决定说不说下面那一句的，是「这个话题她有没有话接」（`channels/interests.py`）。
+
+    **按群算，不是所有群共用一份**：一个热闹的群不该把安静的群的额度吃掉。十个群各十次
+    听起来多，但每个群的「十次」仍然是一天；真嫌吵就把 `QQ_AMBIENT` 关掉或调小这个数。"""
     ambient_idle: float = 0.0
     called: bool = True
     """群里有人提到她时怎么办：@ 她、或者消息里叫了她的名字（名字表在 stage 文件的
@@ -116,6 +125,37 @@ class QQConfig:
     默认 4——她的日记属于好友列表，不属于所有搜得到这个号的人。"""
     qzone_gap: float = 20.0
     """两条之间至少隔多少小时。只写「一天一条」的话，23:50 和 00:10 会被算成两天。"""
+    qzone_web: bool = True
+    """读好友动态、发评论走 QZone 的 Web 接口（用 NapCat 给的 Cookie），还是走 NapCat 上的
+    QZone 扩展 action。
+
+    默认走 Web：官方接口里根本没有读动态和评论这两件事，扩展又是要另装的东西。两条路的
+    权限是同一份（都是这个号的 Cookie），但 Web 那条是逆向接口，腾讯改字段就得跟着改——
+    真出问题时 `QQ_QZONE_WEB=0` 可以退回 action 探测。"""
+    qzone_reply: bool = False
+    """要不要回别人的说说（评论）。默认关：这是**在别人的空间里**说话，比自己的墙更难收回。
+
+    需要 NapCat 那边有读动态和发评论的扩展（`get_qzone_msg_list` / `get_friend_feeds`、
+    `send_qzone_comment` / `send_comment`）。没有的话插件会说不支持并停一天，不会刷日志。"""
+    qzone_reply_hourly: int = 6
+    """**滚动一小时**里最多回几条评论（0 = 不限）。
+
+    按天算的问题：一晚上来十条，第七条要等到第二天早上，留言过夜就凉了。按小时算，
+    最坏也只是等一小时。滚动窗口而不是整点重置——否则 21:59 回六条、22:00 又能回六条，
+    限额等于没有。"""
+    qzone_reply_gap: float = 5.0
+    """两条评论之间至少隔多少分钟。
+
+    五分钟，不是三十。三十是「回别人的动态」那一版的脾气：挨着回一串像机器在刷 feed。
+    这里是别人在她自己墙上留的话——20:20 写的等到 20:50 才回，不叫克制，叫不理人。
+    五分钟只够防「两条挤成一坨」。"""
+    qzone_reply_age: float = 72.0
+    """只回这么多小时以内的评论。评论是给她的留言，不是信息流，所以窗口比说说宽；但回上周的
+    也不算聊天。0 = 不限。"""
+    qzone_reply_posts: int = 3
+    """看最近几条说说。第五新的那条下面的评论，已经是旧事了。"""
+    qzone_reply_ignore: tuple[str, ...] = ()
+    """不回这些人的评论（QQ 号，逗号分隔）。"""
     turn_timeout: float = 180.0
     """一轮对话最多等多久（秒）。没有上限的时候，一次卡住的请求会一直占着并发位，
     两个卡住就整条通道不说话——看起来就是「有时候不回，过一阵又好了」。"""
@@ -134,6 +174,13 @@ class QQConfig:
     voice: bool = False
     admin_token: str = ""
 
+    def bot_of(self, qq_id: str) -> str:
+        """这个 QQ 号背后是哪个角色（不是机器人就返回空）。"""
+        for qq, who in self.bots:
+            if qq == str(qq_id):
+                return who
+        return ""
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "QQConfig":
         env = os.environ if env is None else env
@@ -147,6 +194,7 @@ class QQConfig:
             private=_flag(env, "QQ_PRIVATE", False),
             private_ids=_list(env, "QQ_PRIVATE_IDS"),
             ignore=_list(env, "QQ_IGNORE_IDS"),
+            bots=_pairs(env, "QQ_BOTS"),
             character=(env.get("QQ_CHARACTER") or "").strip(),
             merge_seconds=_float(env, "QQ_MERGE_SECONDS", 1.2),
             member_cooldown=_float(env, "QQ_MEMBER_COOLDOWN", 20.0),
@@ -184,6 +232,13 @@ class QQConfig:
             qzone_p=_float(env, "QQ_QZONE_P", 0.35),
             qzone_right=_int(env, "QQ_QZONE_RIGHT", 4),
             qzone_gap=_float(env, "QQ_QZONE_GAP", 20.0),
+            qzone_web=_flag(env, "QQ_QZONE_WEB", True),
+            qzone_reply=_flag(env, "QQ_QZONE_REPLY", False),
+            qzone_reply_hourly=_int(env, "QQ_QZONE_REPLY_HOURLY", 6),
+            qzone_reply_gap=_float(env, "QQ_QZONE_REPLY_GAP", 5.0),
+            qzone_reply_age=_float(env, "QQ_QZONE_REPLY_AGE", 72.0),
+            qzone_reply_posts=_int(env, "QQ_QZONE_REPLY_POSTS", 3),
+            qzone_reply_ignore=_list(env, "QQ_QZONE_REPLY_IGNORE"),
             turn_timeout=_float(env, "QQ_TURN_TIMEOUT", 180.0),
             digest=_flag(env, "QQ_DIGEST", True),
             digest_dm_days=_float(env, "QQ_DIGEST_DM_DAYS", 3.0),
@@ -243,6 +298,18 @@ def _flag(env: Mapping[str, str], name: str, default: bool) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "on")
+
+
+def _pairs(env: Mapping[str, str], name: str) -> tuple[tuple[str, str], ...]:
+    """`3824843517=luca, 1234=mano` → `(("3824843517", "luca"), …)`. 没有 `=` 的项丢掉：
+    一个半截的映射比没有映射更糟——它会让人以为标好了。"""
+    out: list[tuple[str, str]] = []
+    for part in (env.get(name) or "").replace(";", ",").split(","):
+        qq, _, who = part.strip().partition("=")
+        qq, who = qq.strip(), who.strip()
+        if qq and who:
+            out.append((qq, who))
+    return tuple(out)
 
 
 def _list(env: Mapping[str, str], name: str) -> tuple[str, ...]:

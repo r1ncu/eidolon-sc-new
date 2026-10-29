@@ -19,6 +19,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import time
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -124,6 +125,7 @@ async def serve(options: argparse.Namespace) -> None:
                 action = json.loads(payload)
                 name = action.get("action")
                 params = action.get("params") or {}
+                data: object = {}
                 if name in ("send_group_msg", "send_private_msg"):
                     target = params.get("group_id") or params.get("user_id")
                     said = "".join(
@@ -133,11 +135,43 @@ async def serve(options: argparse.Namespace) -> None:
                     ).strip()
                     kinds = [part.get("type") for part in params.get("message", [])]
                     print(f"fake-napcat: bot said to {target} {kinds} {said!r}", flush=True)
+                elif name == "send_qzone_msg":
+                    # 空间：答一个 tid，否则机器人会认为「可能发出去了」并花掉今天。
+                    print(
+                        f"fake-napcat: bot posted to qzone {params.get('content')!r}"
+                        f" right={params.get('ugc_right')}",
+                        flush=True,
+                    )
+                    data = {"tid": f"fake-{int(time.time())}"}
+                elif name == "get_qzone_msg_list":
+                    # 一条「别人发的」动态，用来试回复那条链路。
+                    data = {
+                        "list": [
+                            {
+                                "tid": "fake-post-1",
+                                "uin": options.user,
+                                "nickname": options.card,
+                                "content": "今天排练到十点，腿都软了。",
+                                "create_time": int(time.time()) - 600,
+                            }
+                        ]
+                    }
+                elif name in ("send_qzone_comment", "send_comment", "comment_qzone_msg"):
+                    print(
+                        f"fake-napcat: bot commented on {params.get('tid')}"
+                        f" {params.get('content')!r}",
+                        flush=True,
+                    )
                 writer.write(
                     write_frame(
                         0x1,
                         json.dumps(
-                            {"status": "ok", "retcode": 0, "echo": action.get("echo"), "data": {}},
+                            {
+                                "status": "ok",
+                                "retcode": 0,
+                                "echo": action.get("echo"),
+                                "data": data,
+                            },
                             ensure_ascii=False,
                         ).encode(),
                     )

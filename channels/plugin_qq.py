@@ -23,8 +23,10 @@ from core.plugin import Plugin, Route
 from . import identities as who
 from . import outbox as box
 from . import qq
-from . import romance
 from . import qzone as space
+from . import qzone_reply as replies
+from . import qzone_web as web
+from . import romance
 from . import stickers as pack
 from .config import QQConfig
 from .digest import DM as DIGEST_DM, GROUP as DIGEST_GROUP
@@ -73,6 +75,19 @@ QZONE_TICK = 60.0
 """How often the space asks whether a post is due. A minute is finer than the calendar needs
 and coarser than a clock; the decision itself is stored, so a missed tick costs nothing."""
 
+QZONE_FEED_TICK = 300.0
+"""How often friends' walls are looked at. A 说说 is not a chat message: five minutes is
+already faster than anyone posts, and each look is one action call plus, at best, one model
+call — so this is a cost knob as much as a clock one."""
+
+WAIT_CONNECT = 5.0
+"""How long the two space loops wait before looking again when the socket is not up yet.
+
+Not the full tick: a restart at 21:05 should post at 21:05, and a poll five seconds after
+`onebot: connected` is what makes 「重启之后它自己接上了」 observable. Five seconds because
+the reconnect backoff starts at one and doubles — this only has to be shorter than the gap
+between attempts, not short in absolute terms."""
+
 DIGEST_FIRST = 90.0
 """Seconds before the first memory rewrite is considered.
 
@@ -111,6 +126,13 @@ class QQService(Plugin):
             else Path(app.settings.media) / "stickers"
         )
         self.pack = pack.Pack(app.store, root, log=self._log)
+        # ── 时区 ──
+        # 每一条「几点之后」的规则都该读同一个时区：`_maybe_monday` 用的是
+        # `datetime.now(_zone(app.settings.timezone))`。空间这里原来用的是
+        # `datetime.now().astimezone()`，也就是**容器自己的时区**；而 compose 只给
+        # napcat 设了 TZ，scbot 里是 UTC。结果 `QQ_QZONE_HOUR=21` 实际在早上五点才算到点——
+        # 白天看是「从来没发过」，日志里也看不出错。
+        self._clock = lambda: datetime.now(_zone(self.app.settings.timezone))
         # Her own space, next to her own voice: the post is written from the same character
         # and published through the same socket, but on a calendar of its own.
         self.qzone = space.Qzone(
@@ -128,7 +150,46 @@ class QQService(Plugin):
             hour=self.config.qzone_hour,
             chance=self.config.qzone_p,
             gap=self.config.qzone_gap,
+            clock=self._clock,
             log=self._log,
+        )
+        # 读别人的墙有两条路：NapCat 上的 QZone 扩展 action（少见），或者直接走 QZone 的
+        # Web 接口（用 NapCat 给的 Cookie，官方接口里没有读动态这件事）。默认后者。
+        self.web = (
+            web.Web(self.client, self_id=self.config.self_id, log=self._log)
+            if self.config.qzone_web
+            else None
+        )
+        # 她自己的墙上的评论：看一眼有没有人回她，回一句。和写说说是两件事——写那条一天
+        # 最多一次，这条是有多少人说就回几句（有上限）。
+        self.wall = replies.Wall(
+            self.client,
+            app.llm,
+            app.store,
+            web=self.web,
+            persona=qq.world_path(
+                app.settings.characters, f"{self.config.character}-qzone.md"
+            )
+            if self.config.character
+            else None,
+            flags=self.pack,
+            self_id=self.config.self_id,
+            # 全局忽略名单也在这里生效：`QQ_IGNORE_IDS` 是「完全不理的号」，一个在群里
+            # 不理、却在她墙上回一句的号，等于那张名单只在半个产品里有效。
+            deny=(*self.config.qzone_reply_ignore, *self.config.ignore),
+            owners=self.config.owners,
+            # 谁是谁的机器人：空间里也一样，不然一条ルカ的台词会被当成陌生群友接。
+            bots={
+                qq_id: (self.app.characters.name_of(who) or who)
+                for qq_id, who in self.config.bots
+            },
+            hourly=self.config.qzone_reply_hourly,
+            gap=self.config.qzone_reply_gap,
+            age=self.config.qzone_reply_age,
+            posts=self.config.qzone_reply_posts,
+            clock=self._clock,
+            log=self._log,
+            on=self.config.qzone_reply,
         )
         self.channel = qq.QQChannel(
             app,
@@ -168,7 +229,7 @@ class QQService(Plugin):
     # ---- the plugin surface
 
     def migrations(self) -> Sequence[str]:
-        return (*who.SCHEMA, *box.SCHEMA, *pack.SCHEMA, *space.SCHEMA)
+        return (*who.SCHEMA, *box.SCHEMA, *pack.SCHEMA, *space.SCHEMA, *replies.SCHEMA)
 
     def capabilities(self) -> dict[str, Any]:
         return {
@@ -180,6 +241,7 @@ class QQService(Plugin):
             "stickers": self.pack.count(),
             "character": self.config.character,
             "qzone": self.config.qzone,
+            "qzone_reply": self.config.qzone_reply,
         }
 
     def routes(self) -> dict[tuple[str, str], Route]:
@@ -274,6 +336,26 @@ class QQService(Plugin):
             self._log(f"qq: 空间删掉了一条（tid {tid}）")
             return {"deleted": True, "tid": tid}
 
+        async def wall_status(query, body):  # noqa: ANN001 - plugin.Route
+            return self.wall.status()
+
+        async def wall_poll(query, body):  # noqa: ANN001 - plugin.Route
+            # 手动拉一次：不等到下一个五分钟。「有没有接到评论」靠这个按钮验。
+            try:
+                return await self.wall.poll()
+            except Exception as exc:  # 一个按钮不该把页面带走
+                return {"ok": False, "why": f"{type(exc).__name__}: {exc}"}
+
+        async def wall_reply(query, body):  # noqa: ANN001 - plugin.Route
+            body = body or {}
+            tid = str(body.get("comment_tid") or body.get("tid") or query.get("comment_tid") or "").strip()
+            if not tid:
+                return {"replied": False, "why": "没有 comment_tid"}
+            try:
+                return await self.wall.answer_tid(tid, str(body.get("text") or "").strip())
+            except Exception as exc:
+                return {"replied": False, "why": f"{type(exc).__name__}: {exc}"}
+
         # Both spellings: a reload is a write to the running process, so POST; GET with the
         # same path answers the same thing and is there because `curl` is easier to type.
         return {
@@ -298,6 +380,11 @@ class QQService(Plugin):
             ("POST", "/api/qzone"): space_post,
             ("POST", "/api/qzone/delete"): space_delete,
             ("GET", "/api/qzone/delete"): space_delete,
+            # 她自己的墙：评论状态 / 现在拉一次 / 手动回一条评论。
+            ("GET", "/api/qzone/comments"): wall_status,
+            ("POST", "/api/qzone/poll"): wall_poll,
+            ("GET", "/api/qzone/poll"): wall_poll,
+            ("POST", "/api/qzone/reply"): wall_reply,
         }
 
     async def send_sticker(self, group: str = "", tag: str = "") -> dict[str, Any]:
@@ -532,7 +619,23 @@ class QQService(Plugin):
                 f"qq: QQ 空间每天 {self.config.qzone_hour}:00 之后有 "
                 f"{self.config.qzone_p:.0%} 的概率发一条"
                 f"（{space.RIGHT.get(self.qzone.right, '')}，两条之间至少隔 "
-                f"{self.config.qzone_gap:g} 小时）"
+                f"{self.config.qzone_gap:g} 小时，按 {self.app.settings.timezone} 的时间）"
+            )
+            if self.config.qzone_p <= 0:
+                # 0% 是「永远不会」，而启动日志里那句「有 0% 的概率」读起来像「有时候」。
+                # 线上真踩过：开关是开的，骰子被设成 0，一个月里一条都没发。
+                self._log(
+                    "qq: QQ_QZONE_P=0 —— 空间永远不会自己发（这不是概率低，是不会发生）。"
+                    "要它自己发，把 QQ_QZONE_P 设成 0.3 左右"
+                )
+        if self.config.qzone_reply:
+            self._spawn(self._qzone_wall())
+            self._log(
+                f"qq: 空间会回评论 —— 每 {QZONE_FEED_TICK / 60:.0f} 分钟看自己的说说，"
+                f"一小时最多 {self.config.qzone_reply_hourly} 条，两条之间至少 "
+                f"{self.config.qzone_reply_gap:g} 分钟，只回 "
+                f"{self.config.qzone_reply_age:g} 小时以内、最近 "
+                f"{self.config.qzone_reply_posts} 条说说下的"
             )
         await self.client.run(self.channel.on_event, on_connect=self._reconnected)
 
@@ -890,13 +993,41 @@ class QQService(Plugin):
 
         宿主机一夜重启三次的时候，内存里的「今天还没发」每次都是从头发一遍 —— 主动私聊
         踩过这个坑（`love:next` 存库），这里一开始就照做：日期、骰子、失败等待全在 `qq_flags`。
+
+        `connected` 这道闸是补上的：`_serve` 里 spawn 这条循环的时候 socket 还没连上，
+        第一次 tick 会以 `not connected` 结束。以前它会记一条失败并把今天压掉两小时，
+        于是「过了点的晚上重启一次」就等于「今天不发」。没连上就不该是发布。
         """
         while True:
             try:
+                if not getattr(self.client, "connected", False):
+                    await asyncio.sleep(WAIT_CONNECT)
+                    continue
                 await self.qzone.maybe()
             except Exception as exc:  # 一条说说发不出去，不该把整条通道带走
                 self._log(f"qq: 空间这一轮出错（{type(exc).__name__}: {exc}）")
             await asyncio.sleep(QZONE_TICK)
+
+    async def _qzone_wall(self) -> None:
+        """Look at her own posts on a timer, answer the comments under them.
+
+        No push exists for this: NapCat has no `notice` event for 「有评论」, and its only
+        official QZone actions are send and delete. So it is a poll, and the design is about
+        being a polite one — five minutes apart, an hourly cap, a gap between two answers, the
+        first run only records, and a post whose comment count has not changed is not fetched
+        again.
+        """
+        while True:
+            try:
+                if not getattr(self.client, "connected", False):
+                    await asyncio.sleep(WAIT_CONNECT)
+                    continue
+                result = await self.wall.poll()
+                if result.get("replied"):
+                    self._log(f"qq: 空间回了 {result['replied']} 条评论")
+            except Exception as exc:  # 回不了评论，聊天照旧
+                self._log(f"qq: 空间评论这一轮出错（{type(exc).__name__}: {exc}）")
+            await asyncio.sleep(QZONE_FEED_TICK)
 
     async def _monday(self) -> None:
         """Every Monday, one sticker. Checked once a minute so a restart, a long sleep or a

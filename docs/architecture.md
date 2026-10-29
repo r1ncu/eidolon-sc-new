@@ -41,7 +41,7 @@
 | 插件 | 11 个 + 1 个通道 | `plugins/`、`channels/` |
 | 数据表 | 21 张（内核 3 + 插件 11 + 通道 7） | 见 §2.6 |
 | 角色 | 28 位（1 位有完整私有资料） | `characters/characters.toml` |
-| 单元测试 | 662 条 | `python -m unittest discover -s tests -t .` |
+| 单元测试 | 765 条 | `python -m unittest discover -s tests -t .` |
 | 容器 | 2 个（内核 + NapCat） | `docker-compose.yml` |
 
 三条贯穿全项目的设计纪律，先记住这三条，后面所有设计都是它们的推论：
@@ -188,7 +188,8 @@ scbot-new/
 │   ├── interests.py          插话判断（含「她认识的同行」）
 │   ├── digest.py             记忆文件：定期整份重写
 │   ├── stickers.py           表情包：收录、打标、挑选
-│   ├── qzone.py             ★ QQ 空间说说
+│   ├── qzone.py             ★ QQ 空间说说（自己的墙）
+│   ├── qzone_feed.py        ★ 别人的说说：拉动态、回评论
 │   ├── identities.py         QQ 号 ↔ 内核用户 + 次数/静音/恋爱标记
 │   ├── stage.py / texts.py   角色自己的措辞与拒绝台词
 │   └── (world/<id>-*.md|toml 在 characters/ 下)
@@ -211,7 +212,7 @@ scbot-new/
 │   └── memory/               自动生成的记忆文件（digest 写入）
 │
 ├── web/                      SPA：index.html + app.js(200KB) + CSS
-├── tests/                    662 条测试，全离线
+├── tests/                    765 条测试，全离线
 ├── tools/                    自检工具（见附录 A）
 └── docs/                     本文与通道包文档
 ```
@@ -474,6 +475,7 @@ PRAGMA journal_mode=WAL
 | 通道 | `qq_flags` | stickers | 键值：定时任务的「下一次」「今天发过」 |
 | 通道 | `qq_digest` | digest | 记忆文件的水位（写到第几条消息） |
 | 通道 | `qzone_posts` | qzone | 说说记录（tid、正文、是否成功） |
+| 通道 | `qzone_feeds` | qzone_feed | 别人的动态与评论（tid、作者、正文、回没回） |
 
 一条实用提醒：**`messages.text` 对助手那句话是空的**，内容在 `segments` JSON 里。
 查历史别查错列：
@@ -970,7 +972,8 @@ qq: 看了一眼群里，没接（没什么可接的）
 | `_love` | 300s 看一眼 | `qq_flags: love:next` / `love:last` | 恋爱中主动私聊（随机间隔 60~150 分钟） |
 | `_idle` | 60s | 无 | 群里安静够久时她自己开口（默认关） |
 | `_digest` | 90s 首次 → 3600s | `qq_digest` 水位 | 到期就重写记忆文件 |
-| `_qzone` | 60s | `qq_flags: qzone:*` | 到点且掷中才发说说 |
+| `_qzone` | 60s | `qq_flags: qzone:*` | 到点且掷中才发说说（没连上不算一次发布） |
+| `_qzone_feed` | 300s | `qzone_feeds` 表 + `qq_flags: qzone:feed:*` | 看好友动态，回一句（有额度、间隔、时效） |
 | `_monday` | 60s | `qq_flags: monday:<ISO 周>` | 周一发「上班」表情 |
 
 **为什么 `_love` 的间隔要存库**：随机间隔放在内存里，重启一次就重画一次。
@@ -1079,6 +1082,10 @@ def _sticker_row(self):
 `channels/qzone.py`：她自己的独白，**不是回复任何人**，所以不需要回合那套机械，
 需要的是**日历**和**克制**。
 
+「独白」说的是内容形态（没有人问、没有上文），**不是语气**：空间是公开的，好友、同事、
+半熟的人都刷得到，所以口径按 `characters/world/<id>-qzone.md` 走——写的是公共场合的她
+（ふゆ），不是私下的那个人。私聊的语气（「あんた」「〜わよ」那一侧）在空间里一句都不能出现。
+
 **接口事实**（NapCat 扩展，不在 OneBot 11 里）：
 
 ```
@@ -1094,12 +1101,23 @@ delete_qzone_msg {tid}
 
 ```
 QQ_QZONE=1 且 有人设文件 world/<id>-qzone.md（没有就拒发）
-→ 过了 QQ_QZONE_HOUR（默认 21:00）
+→ 过了 QQ_QZONE_HOUR（默认 21:00，按 SCCORE_TIMEZONE）
 → 今天没发过（qzone:day）
 → 距上一条 ≥ QQ_QZONE_GAP（20 小时）
 → 不在失败等待期（2 小时）
 → 掷一次骰子并落库（qzone:roll:<日期>，一天只掷一次）
 ```
+
+**两个踩过的坑**（都是「配置是好的，但从来没发过」）：
+
+1. **时区**。这条链上原来的钟是 `datetime.now().astimezone()`，也就是**容器的**时区；
+   compose 只给 napcat 设了 `TZ`，内核容器是 UTC。于是 `QQ_QZONE_HOUR=21` 实际要等到
+   北京时间早上五点才算到点。现在和别的定时任务一样读
+   `datetime.now(_zone(settings.timezone))`——「几点之后」在整条通道里是同一个意思。
+2. **启动那一下**。`_qzone` 是 `_serve` 里 spawn 的，第一次 tick 跑在 socket 连上之前，
+   会拿到 `not connected`。原先那算一次**发布失败**：写一条失败记录、把今天压掉两小时，
+   于是「过了点的晚上重启一次」就等于「今天不发」。现在 `network` 不算发布——不写历史、
+   不压等待，下一个 tick 再试；循环本身也先看 `client.connected`。
 
 **内容闸（`_check`，拒绝而不是提醒）**：
 
@@ -1127,6 +1145,104 @@ QQ_QZONE=1 且 有人设文件 world/<id>-qzone.md（没有就拒发）
 
 **接口**：`GET /api/qzone`、`POST /api/qzone {text?, publish?}`、`POST /api/qzone/delete {tid}`。
 手动发不过日历，但**过内容闸**；开关关着时它也拒绝（否则「功能关着」只是「定时器关着」）。
+
+`GET /api/qzone` 里的 `last_why` / `last_at` 是「为什么今天没发」的答案（「还没到点」
+「今天抽到的签是不写」「还没连上」…），`now` 是它当时用的钟——一个两小时前的理由看起来
+和现在的理由一模一样，所以两个都带上。
+
+### 4.11.1 回她自己墙上的评论
+
+`channels/qzone_reply.py`：**只看她自己的说说下面有没有人评论**，有就回一句，没人评论就不管。
+不是好友动态、不是别人的墙——那两样她不需要。
+
+**先说清现实**：NapCat 的 QZone 官方接口只有 `send_qzone_msg` 和 `delete_qzone_msg`，
+`get_qzone_msg_list` / `send_qzone_comment` 在 mlikiowa/napcat-docker 上一律回
+`retcode 1404 不支持的API`。所以走 `channels/qzone_web.py`——用 NapCat 已经给出的 Cookie
+直接问 QZone：
+
+```
+get_cookies {domain: user.qzone.qq.com}  → p_skey / skey / p_uin
+g_tk = hash33(p_skey)                    → 评论的签名
+读说说：emotion_cgi_msglist_v6            → tid / content / created_time / cmtnum
+读评论：emotion_cgi_msgdetail_v6          → 评论的 tid、uin、name、content，以及 list_3（楼中楼）
+回评论：emotion_cgi_re_feeds（h5 域名）    → paramstr=2 + commentId/commentUin + 正文前缀标记
+```
+
+分工是刻意的：`qzone_web.py` 只管协议（Cookie、签名、解析、失败分类），`qzone_reply.py`
+只管「要不要回、回什么」。`QQ_QZONE_WEB=0` 时它不工作——这条功能没有 action 版本，
+因为官方接口里根本没有「读评论」这件事。
+
+**一次 tick（`poll()`，5 分钟）**：
+
+```
+没开 / 没人设文件 / 还在暂停期 → 说不回，以及为什么
+拉最近 N 条说说（QQ_QZONE_REPLY_POSTS，默认 3）
+  → cmtnum = 0 的跳过（没人评论，不值得再发一个请求）
+  → cmtnum 没变、且距上次看不过 30 分钟，也跳过（见下面「cmtnum 只数一级评论」）
+  → 否则拉一次评论列表，逐条过闸，没见过的写进 qzone_comments
+第一次拉取（qzone:reply:begun 为空）→ 只记录，不回
+否则：按时间从旧到新，回得起就回
+```
+
+**回不回的四道闸**：
+
+| 闸 | 规则 |
+|---|---|
+| 是谁 | 她自己发的评论（`uin` 是自己）不回、`QQ_QZONE_REPLY_IGNORE` / `QQ_IGNORE_IDS` 不回 |
+| 说给谁 | **楼中楼里别人之间的对话不看**。只回「对她说」的那句：一级评论算对她说的；楼里的回复要看 `@{uin:…}` 标记指向谁，指向别人就跳过 |
+| 多旧 | 只回 `QQ_QZONE_REPLY_AGE`（72 小时）以内的——评论是留言，窗口比说说宽，但回上周的也不算聊天 |
+| 一小时几条 | `QQ_QZONE_REPLY_HOURLY`（6），**滚动窗口**（`replied_at >= now-1h`），不是整点重置。按天算会把第七条推到第二天早上，留言过夜就凉了 |
+| 两条之间 | `QQ_QZONE_REPLY_GAP`（5 分钟）。**三十是从「回别人动态」那版继承下来的**：那里一串评论像机器在刷feed；这里是她墙上的留言，20:20 写的等到 20:50 才回，不叫克制，叫不理人。五分钟只够防「两条挤在一起」 |
+
+**说不说话，是模型的事**，但那条线是「辱骂」，不是「不客气」：低俗/性相关、骂人、
+纯属复读报错的，只输出 `SKIP`；**找茬、抬杠、拿她跟别人比的要回**——损回去正是她的本事，
+「要扣分哦」比沉默更像她。另外 `qzone_reply.COARSE` 那一小串词在**进模型之前**就挡掉了——不是
+内容审查，是「这种话她不回」，而一个被客客气气问的模型有时会硬回。
+
+**内容闸**（`check`）：4～60 字，5 位以上连续数字 / 链接 / `@` / 破功词一律拒。
+
+**状态**：`qzone_comments.state` 三态——`0` 待回、`1` 回过（`reply` 是原话）、`2` 不回
+（第一次拉取时就有的、她自己发的、被忽略的人、或者模型说 SKIP）。写进库而不是内存：
+重启不能让同一条被回两次，也不能让当天的额度归零。
+
+**接口**：`GET /api/qzone/comments`（看到什么、回了谁、暂停状态）、
+`POST /api/qzone/poll`（现在拉一次）、
+`POST /api/qzone/reply {comment_tid, text?}`（手动回一条；不给 text 就让她自己写）。
+
+**一条回复要落进楼里，四样都得对**（`Web.reply`，真机验过）：
+
+```
+POST https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds?g_tk=…
+topicId   = <说说作者uin>_<说说tid>__1
+paramstr  = 2                       ← 1 是新评论，2 是回复
+commentId = <一级评论的 tid>         ← 锚点必须是楼根，指向回复会被忽略
+commentUin= <一级评论的作者 uin>
+content   = @{uin:<被回复的人>,nick:<昵称>,auto:1} 正文
+```
+
+`@{uin:…}` 那个前缀不是装饰：QZone 靠它画「回复 某某」，缺了它，回复就变成一句普通评论。
+
+**六个坑**，都试出来过：
+
+- `topicId` 传裸 tid 会被当成 `t1_uin=0 / t1_tid=0`，回 `-10004 参数错误`；必须是
+  `<作者uin>_<tid>__1`。**少了 `__1` 也能过**，但写出来的只是普通评论。
+- **写接口的 `g_tk` 必须在 query 里**（`?g_tk=…`）。只放在表单里，`emotion_cgi_re_feeds`
+  会回一个**包体为空的 HTTP 500**——读接口两种都认，所以这个差别只在「写」上露头，
+  而且长得像限流。查法：同一分钟里手写请求成功、`Web.reply` 失败，差异就只剩 URL。
+- **失败模式是「成功」**：`t2_*` 那套参数（`t2_uin`/`t2_tid`）在真机上回 `code:0`，
+  却在说说下面多出一条普通评论——日志里看起来一切正常。所以「回出去了」不等于
+  「回进楼了」，唯一的验证是把评论列表读回来，看那条评论的 `list_3`。
+  这条弯路走过一次，别再走：`t1_*`、`t2_*`、`addreply_ugc` 都不是楼中楼。
+- **`cmtnum` 只数一级评论**（实测 `cmtnum=1` 时楼下已有两条回复），所以「评论数没变就不看」
+  会漏掉「有人回复了她的回复」。`RECHECK=30` 分钟是补这个洞的：数没变也每半小时读一次。
+- **评论发出去收不回来**：`emotion_cgi_delcomment` 在真机上一律 HTTP 500（试过九种参数
+  组合），所以通道不提供「撤回」。上面那些闸因此不是小心，是唯一一道防线。
+  （有意思的是 500 之后评论确实被删掉了——它不可靠，不写成功能。）
+- 「第一次拉取」记的是 `qzone:reply:begun` 这个 flag，不是「表是空的」——好友那天没评论的
+  部署，用后者会把每一次都当成第一次，于是永远不回。
+
+**楼中楼在库里是 `root_tid` + `comment_tid`**：QZone 给一级评论和回复各自编号，`1` 两边
+都有，所以回复存成 `<root>.<tid>`，锚点另存一列。发的时候只用到锚点，`tid` 只是身份。
 
 ### 4.12 其余子模块
 
@@ -1549,7 +1665,8 @@ python3 serve.py --fake --port 8100
 | `QQ_PRIVATE_IDS` | 空 | 谁能私聊（空 = 用 `QQ_OWNER_IDS`） |
 | `QQ_ONEBOT_WS` | `ws://127.0.0.1:3001` | 容器里是 `ws://napcat:3001` |
 | `QQ_ONEBOT_TOKEN` | 空 | 与 NapCat 里设的一致 |
-| `QQ_IGNORE_IDS` | 空 | 完全不理的号 |
+| `QQ_IGNORE_IDS` | 空 | 完全不理的号：消息不进 `heard`，也不回 |
+| `QQ_BOTS` | 空 | 别的角色的机器人（`号码=角色id`）。说话时提示词里多一行「这个号不是人，是〇〇的机器人」，语气按认识的人走——不标的话，一段ルカ的台词会被当成陌生群友的寒暄来接 |
 | `NAPCAT_WEBUI_TOKEN` | — | **必填**（compose 里没有它会拒绝启动） |
 
 ### 9.3 群聊行为
@@ -1807,6 +1924,9 @@ compose 里已经有 `security_opt: apparmor=unconfined`，`napcat` 还有 `secc
   `up -d` 重建容器即恢复。
 - **`send_qzone_msg` 是 NapCat 扩展，不是 OneBot 标准**。换别的 OneBot 实现，
   空间功能整个不可用（`unsupported` 会记 24 小时）。
+- **没有「有人发说说」的事件**，也没有官方的好友动态接口。回别人的动态只能轮询，
+  而且依赖装在 NapCat 上的 QZone 扩展（`get_qzone_msg_list` / `send_qzone_comment` 等）——
+  名字随扩展变，所以代码是探测式的：第一个答得上的就记住。
 - **`fetch_custom_face` 回包是数组**，不是对象。所以 `OneBot.call_raw()` 存在——
   `call()` 会把非 dict 缩成 `{}`，让唯一的列表接口看起来像空的。
 - **QQ 消息的图片 `file` 字段是 NapCat 容器内的路径**，从这里读不到；只有 `url` 有用。
@@ -1846,14 +1966,15 @@ PYTHONPATH=. python -m unittest discover -s tests -t .          # 全部
 PYTHONPATH=. python -m unittest tests.test_channels -v          # 单个模块
 ```
 
-**662 条，全离线**：模型是脚本化的（`ScriptedLLM`）、OneBot 是假的、时钟是注入的、
+**765 条，全离线**：模型是脚本化的（`ScriptedLLM`）、OneBot 是假的、时钟是注入的、
 文件写在临时目录。所以它可以在任何机器上跑，不花钱、不联网、不发消息。
 
 | 文件 | 条数 | 覆盖 |
 |---|---|---|
 | `test_channels.py` | 最多 | 通道：判定、合并、冷却、插话、表情、指令、档位、空间按钮 |
 | `test_plugins.py` | 次多 | 各插件：好感度、生闷气、礼物、记忆、资料、剧情 |
-| `test_qzone.py` | 36 | 空间：日历、内容闸、失败分类、手动入口 |
+| `test_qzone.py` | 39 | 空间：日历、内容闸、失败分类（含「没连上不算发布」）、手动入口 |
+| `test_qzone_feed.py` | 25 | 别人空间：探测降级、只回一次、额度与间隔、第一次只记录 |
 | `test_turn.py` / `test_host.py` / `test_prompt.py` / `test_protocol.py` | — | 内核四阶段、插件调度、提示词槽位、回复解析 |
 | `test_store.py` / `test_quota.py` / `test_recall.py` / `test_stories.py` | — | 存储、滑动窗口、检索、话题匹配 |
 | `test_live.py` / `test_judge.py` / `test_server.py` / `test_frontend.py` / `test_dropin.py` | — | 热加载、判分解析、HTTP、前端资源、插件可拆卸性 |

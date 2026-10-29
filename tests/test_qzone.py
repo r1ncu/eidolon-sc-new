@@ -259,6 +259,31 @@ class TestFailing(Base):
         result = asyncio.run(self.zone(bot=Bot(fail=down)).maybe())
         self.assertEqual(result["why"], "network")
 
+    def test_not_being_connected_yet_is_not_a_failed_post(self):
+        """进程刚起来、socket 还没连上的那一次，不是「发布失败」。
+
+        以前它会写一条失败记录并把今天压掉两小时 —— 于是「过了点的晚上重启一次」等于
+        「今天不发」，而那正是线上看到的现象：配置是好的，从来没发出去过。
+        """
+        result = asyncio.run(self.zone(bot=Bot(fail=RuntimeError("not connected"))).maybe())
+        self.assertEqual(result["why"], "network")
+        self.assertEqual(self.store.query("SELECT id FROM qzone_posts"), [], "没连上不写历史")
+        self.assertEqual(self.flags.flag("qzone:fail"), "", "也不该压住下一个 tick")
+
+        # 连上以后，同一个 tick 的下一轮就能发。
+        self.assertTrue(asyncio.run(self.zone().maybe())["posted"])
+
+    def test_a_socket_that_is_down_does_not_cost_a_model_call(self):
+        """断线时连模型都不该叫：写一条出来也没地方发，而那是要花钱的。"""
+        bot = Bot()
+        bot.connected = False
+        llm = ScriptedLLM(GOOD)
+        zone = self.zone(bot=bot, llm=llm)
+        result = asyncio.run(zone.maybe())
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["why"], "还没连上")
+        self.assertEqual(llm.seen, [])
+
     def test_an_answer_without_a_tid_spends_the_day(self):
         """接口说成了但没给 tid：可能已经发出去了，宁可不发第二条。"""
         bot = Bot(answer={})
@@ -405,6 +430,14 @@ class TestTheSmallerPieces(Base):
         self.assertTrue(status["today"])
         self.assertEqual(len(status["recent"]), 1)
         self.assertTrue(status["recent"][0]["ok"])
+        self.assertEqual(status["last_why"], "发了", "「今天发了」也要有话说")
+
+    def test_the_status_page_says_why_it_did_not_post(self):
+        """「她今天没发」不是一个答案；答案是「还不到点」「抽到的签是不写」这些。"""
+        self.clock.at = EVENING.replace(hour=9)
+        zone = self.zone()
+        asyncio.run(zone.maybe())
+        self.assertEqual(zone.status()["last_why"], "还不到点")
 
     def test_the_endpoint_writes_without_publishing_when_asked(self):
         bot = Bot()

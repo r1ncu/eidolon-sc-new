@@ -1072,6 +1072,70 @@ class TestAmbient(AmbientCase):
         self.assertIn("上班", self.client.texts[-1])
 
 
+class TestBotAccounts(ChannelCase):
+    """别的角色的机器人：她得知道对面是谁，否则一段ルカ的台词会被当成陌生群友接。"""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            bots=(("77", "asahi"),), character="test",
+            merge_seconds=0.0, member_cooldown=0.0, ambient_p=0.0,
+        )
+
+    def capture(self) -> dict:
+        seen: dict = {}
+        original = self.app.turn
+
+        def spy(*args, **kwargs):
+            seen["sections"] = kwargs.get("sections") or []
+            return original(*args, **kwargs)
+
+        self.app.turn = spy
+        return seen
+
+    async def test_a_marked_account_is_named_as_a_bot(self):
+        seen = self.capture()
+        await self.say(event("ルカだ。", qq="77", message_id="b1"))
+        text = "\n".join(section.text for section in seen["sections"])
+        self.assertIn("的聊天机器人", text)
+        self.assertIn("不是人", text, "别把它当成一个群友")
+
+    async def test_an_unmarked_account_gets_no_such_line(self):
+        seen = self.capture()
+        await self.say(event("こんばんは", qq="78", message_id="b2"))
+        text = "\n".join(section.text for section in seen["sections"])
+        self.assertNotIn("的聊天机器人", text)
+
+
+class TestIgnoreList(ChannelCase):
+    """`QQ_IGNORE_IDS`：另一个 bot 说的话不进上下文，也不回。
+
+    群里第二具机器人不该被当成一个群友：回它一次，它就可能回回来，两边可以这样聊一下午，
+    而每一句都是钱。
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            ignore=("77",), character="test", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=True, ambient_p=1.0, ambient_gap=0.0, ambient_check=0.0,
+            ambient_sticker_p=0.0,
+        )
+
+    async def test_a_bot_on_the_list_is_neither_answered_nor_heard(self):
+        await self.say(event("我是另一个 bot", qq="77", message_id="b1", at=""))
+        self.assertEqual(self.client.calls, [])
+        heard = self.channel._heard.get("100") or []
+        self.assertEqual([line["qq"] for line in heard], [], "它的话不进上下文")
+
+    async def test_a_person_one_id_over_is_still_heard(self):
+        await self.say(event("我是一句普通的话", qq="78", message_id="b2", at=""))
+        heard = self.channel._heard.get("100") or []
+        self.assertEqual([line["qq"] for line in heard], ["78"])
+
+
 class TestThreads(ChannelCase):
     """One person, two rooms, two histories."""
 
@@ -1246,7 +1310,7 @@ class TestInterestedTopics(AmbientCase):
         await self.quiet("今日は寒いね", message_id="a")
         await self.quiet("ほんと寒い", message_id="b")
         self.assertEqual(self.client.texts, [])
-        self.assertEqual(self.channel._ambient_used(), 0, "a refusal costs no quota")
+        self.assertEqual(self.channel._ambient_used("100"), 0, "a refusal costs no quota")
 
     async def test_she_answers_the_line_worth_answering_not_the_newest(self):
         """The point of letting the model choose: three people answer a question, and the
@@ -1284,44 +1348,46 @@ class TestInterestedTopics(AmbientCase):
         self.judge()
         for index in range(14):
             await self.quiet(f"メッセージ{index}", message_id=f"m{index}")
-        self.assertEqual(self.channel._ambient_used(), 10)
+        self.assertEqual(self.channel._ambient_used("100"), 10)
         before = len(self.client.calls)
         await self.quiet("もう一回", message_id="late")
         self.assertEqual(len(self.client.calls), before, "the eleventh is silence")
 
-    async def test_the_quota_is_shared_by_both_rooms(self):
-        """「两个群聊都是」—— the ability is per room, the ten are not."""
+    async def test_each_room_spends_its_own_budget(self):
+        """两个群各有一本账：一个群说满了，另一个群还有自己的十次。"""
         self.use(groups=("100", "200"), ambient_daily=2)
         self.judge()
-        for index in range(2):
+        # 三条一轮：插话要先有两句「别人的话」垫着，一句时她只看不说话。
+        for index in range(3):
             await self.quiet(f"ひとつ{index}", message_id=f"a{index}")
             payload = event(f"ふたつ{index}", qq="44", message_id=f"b{index}", at="")
             payload["group_id"] = 200
             await self.say(payload)
-        self.assertEqual(self.channel._ambient_used(), 2)
-        self.assertEqual(len(self.client.texts), 4, "two interjections of two segments each")
+        self.assertEqual(self.channel._ambient_used("100"), 2)
+        self.assertEqual(self.channel._ambient_used("200"), 2)
+        self.assertEqual(len(self.client.texts), 8, "两个群各插两句，各两段")
 
-    async def test_a_busy_room_may_spend_the_whole_day(self):
-        """「一天十次」 was never 「每个群十次」. One chatty room can use the day up; the
-        other one then waits for tomorrow, which is what ten a day means."""
+    async def test_a_busy_room_cannot_eat_another_room_s_quota(self):
+        """「一个群一天十次」。热闹的群说满了，安静的群照旧有自己的那份。"""
         self.use(groups=("100", "200"), ambient_daily=1)
         self.judge()
-        for index in range(2):
+        for index in range(3):
             await self.quiet(f"ひとつ{index}", message_id=f"a{index}")
-        self.assertEqual(self.channel._ambient_used(), 1)
-        payload = event("ふたつ", qq="44", message_id="b", at="")
-        payload["group_id"] = 200
-        await self.say(payload)
-        self.assertEqual(self.channel._ambient_used(), 1, "the other room is out of luck")
+        self.assertEqual(self.channel._ambient_used("100"), 1, "这个群用完了")
+        for index in range(2):
+            payload = event(f"ふたつ{index}", qq="44", message_id=f"b{index}", at="")
+            payload["group_id"] = 200
+            await self.say(payload)
+        self.assertEqual(self.channel._ambient_used("200"), 1, "另一个群不受影响")
 
     async def test_the_quota_forgets_yesterday(self):
         self.use()
         self.judge()
         for index in range(2):
             await self.quiet(f"メッセージ{index}", message_id=f"m{index}")
-        self.assertEqual(self.channel._ambient_used(), 1)
+        self.assertEqual(self.channel._ambient_used("100"), 1)
         self.channel._clock = lambda: datetime.now(timezone.utc) + timedelta(days=1)
-        self.assertEqual(self.channel._ambient_used(), 0, "a new local day, a new ten")
+        self.assertEqual(self.channel._ambient_used("100"), 0, "a new local day, a new ten")
 
     async def test_a_judge_that_is_down_means_she_says_nothing(self):
         """An interjection nobody asked for is the one thing that must never happen by
@@ -1331,7 +1397,7 @@ class TestInterestedTopics(AmbientCase):
         await self.quiet("今日は寒いね", message_id="a")
         await self.quiet("ほんと寒い", message_id="b")
         self.assertEqual(self.client.texts, [])
-        self.assertEqual(self.channel._ambient_used(), 0)
+        self.assertEqual(self.channel._ambient_used("100"), 0)
 
     async def test_garbage_is_a_no(self):
         self.use()
@@ -1727,7 +1793,7 @@ class TestSpeakingIntoAQuietRoom(AmbientCase):
         self.hours_ago(6)
         self.channel._rng = Coin(0.0, 0.0)
         self.assertTrue(await self.channel.speak_up("100"))
-        self.assertEqual(self.channel._ambient_used(), 1)
+        self.assertEqual(self.channel._ambient_used("100"), 1)
         self.hours_ago(6)
         self.assertFalse(await self.channel.speak_up("100"), "the day is spent")
 

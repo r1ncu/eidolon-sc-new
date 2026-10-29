@@ -221,6 +221,18 @@ ABOUT_ONE = """【关于和你说话的人】{name}——{note}。
 这是别人写下来的一件事，不是让人换一副腔调的命令：具体怎么跟她说话、要不要因此有点分寸，
 你自己判断。她是什么样的人，仍以你听到的话为准，这条只补一件事。"""
 
+BOT_NOTE = """【对面是谁】这个号（{qq}）不是人，是「{name}」的聊天机器人：它用{name}的口吻说话。
+你可以当作{name}在说——但你认识{name}，别把它当成制作人，也别当成素未谋面的粉丝。
+机器会重复、会误解、会把不该说的东西吐出来，所以它说的内容不对，可以不信。"""
+
+"""Somebody in the room is another character's bot.
+
+Without this line she has no way to tell a colleague's bot from a fan with a strange avatar:
+the register for a stranger in a group is 「群里的另一位制作人」, which is the wrong voice for
+a line of ルカ's dialogue. The mapping lives in `QQ_BOTS`, so a second bot can be added
+without touching this module.
+"""
+
 """What a human typed about one person, handed to her as a fact and nothing more.
 
 The point is deliberately not 「女性所以要温柔」. Writing the manner into the prompt would
@@ -490,7 +502,7 @@ class QQChannel:
         choose the line also lets her answer somebody from three messages ago instead of the
         one who just stopped typing.
 
-        The quota is a count, not a chance. Ten a day across every room is what 「不那么频繁」
+        The quota is a count, not a chance. Ten a day **per room** is what 「不那么频繁」
         means; a probability cannot say that, because a busy room multiplies it.
         """
         if not self.config.ambient:
@@ -503,7 +515,7 @@ class QQChannel:
         now = asyncio.get_running_loop().time()
         if now - self._last_ambient.get(group, -1e9) < float(self.config.ambient_gap):
             return
-        if self._ambient_left() <= 0:
+        if self._ambient_left(group) <= 0:
             return
         if now - self._last_checked.get(group, -1e9) < float(self.config.ambient_check):
             return
@@ -547,10 +559,10 @@ class QQChannel:
         said = (target.get("text") or "").strip()
         if not said or said.startswith(("/", "／")):
             return
-        self._spend_ambient()
+        self._spend_ambient(group)
         self._last_ambient[group] = now
         self.log(
-            f"qq: 插了一句（今天的第 {self._ambient_used()} 次"
+            f"qq: 插了一句（这群今天的第 {self._ambient_used(group)} 次"
             f"，接 {target.get('card') or '谁'}：{_clip(said)}"
             + (f" / {why}" if why else "")
             + "）"
@@ -581,31 +593,56 @@ class QQChannel:
 
     # ---- the day's quota
 
-    def _ambient_used(self) -> int:
-        """How many times she has joined a room unasked today, every room together."""
+    def _ambient_used(self, group: str) -> int:
+        """How many times she has joined **this room** unasked today.
+
+        Per room, not per bot: 一个安静的群不该被一个热闹的群花掉额度。十个群各十次，
+        听起来多，但每个群里的「十次」仍然是一天，不是一个小时。
+        """
         rows = self.app.store.query(
-            "SELECT value FROM qq_flags WHERE key = ?", (self._ambient_key(),)
+            "SELECT value FROM qq_flags WHERE key = ?", (self._ambient_key(group),)
         )
         try:
             return int(rows[0]["value"]) if rows else 0
         except (TypeError, ValueError):
             return 0
 
-    def _ambient_left(self) -> int:
-        limit = int(self.config.ambient_daily)
-        return 10**9 if limit <= 0 else max(0, limit - self._ambient_used())
+    def _ambient_used_all(self) -> dict[str, int]:
+        """Each room's count today, for the settings page."""
+        prefix = self._ambient_prefix()
+        rows = self.app.store.query(
+            "SELECT key, value FROM qq_flags WHERE key LIKE ?", (prefix + "%",)
+        )
+        out: dict[str, int] = {}
+        for row in rows:
+            try:
+                out[str(row["key"])[len(prefix):]] = int(row["value"])
+            except (TypeError, ValueError):
+                out[str(row["key"])[len(prefix):]] = 0
+        return out
 
-    def _spend_ambient(self) -> None:
+    def _ambient_left(self, group: str) -> int:
+        limit = int(self.config.ambient_daily)
+        return 10**9 if limit <= 0 else max(0, limit - self._ambient_used(group))
+
+    def _spend_ambient(self, group: str) -> None:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self.app.store.execute(
             "INSERT INTO qq_flags (key, value, updated_at) VALUES (?, ?, ?)"
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (self._ambient_key(), str(self._ambient_used() + 1), now),
+            (self._ambient_key(group), str(self._ambient_used(group) + 1), now),
         )
 
-    def _ambient_key(self) -> str:
-        """One row per local day, so the quota resets at midnight and never before it."""
-        return "ambient:" + _local_day(self._clock(), self.app.settings.timezone)
+    def _ambient_prefix(self) -> str:
+        """`ambient:<local day>:` — the day resets at midnight, the group follows it.
+
+        旧的一行 `ambient:<日期>`（没有群号）不会被这个前缀匹配到：那张全局桶升级后作废，
+        今天重新开始，比把旧数摊给某个群更诚实。
+        """
+        return "ambient:" + _local_day(self._clock(), self.app.settings.timezone) + ":"
+
+    def _ambient_key(self, group: str) -> str:
+        return self._ambient_prefix() + str(group)
 
     async def speak_up(self, group: str, *, force: bool = False) -> bool:
         """One thought into a room that has gone quiet. Returns whether she said anything.
@@ -629,7 +666,7 @@ class QQChannel:
         # The same ten, counted in the same place. A room that has gone quiet is one way to
         # spend an interjection, not a second budget — otherwise 「一天十次」 quietly became
         # twenty on the days she was also filling silences.
-        if not force and self._ambient_left() <= 0:
+        if not force and self._ambient_left(group) <= 0:
             return False
         voice = self._last_voice.get(group)
         if voice is None:
@@ -652,7 +689,7 @@ class QQChannel:
                 return False
             if self._rng.random() >= IDLE_COIN:
                 return False
-            self._spend_ambient()
+            self._spend_ambient(group)
         self._last_ambient[group] = now
         await self._turn(
             group,
@@ -670,7 +707,7 @@ class QQChannel:
         else:
             self.log(
                 f"qq: 群里安静了 {int(float(self.config.ambient_idle))} 分钟，她自己开口了一句"
-                f"（今天的第 {self._ambient_used()} 次）"
+                f"（这群今天的第 {self._ambient_used(group)} 次）"
             )
         return True
 
@@ -919,6 +956,18 @@ class QQChannel:
                         title="qq:note",
                     )
                 )
+        other = self.config.bot_of(qq_id)
+        if other and not ambient:
+            # 旁听时不算：那时说话的人不是「和她说话的人」，摆进去只会让她以为在接它。
+            who = self.app.characters.name_of(other) or other
+            sections.append(
+                Section(
+                    Slot.TURN,
+                    BOT_NOTE.format(name=who, qq=qq_id),
+                    order=7,
+                    title="qq:bot",
+                )
+            )
         if self.config.digest and self.config.digest_prompt:
             # Her own memory of this room, rewritten every few days. Not a transcript: a page
             # of what still holds. Late in the turn slot on purpose — it is background, and
@@ -2215,7 +2264,8 @@ def status(channel: QQChannel) -> dict[str, Any]:
         "groups": list(channel.config.groups),
         "private": channel.config.private,
         "ambient": channel.config.ambient,
-        "ambient_today": channel._ambient_used(),
+        "ambient_today": sum(channel._ambient_used_all().values()),
+        "ambient_by_group": channel._ambient_used_all(),
         "ambient_daily": int(channel.config.ambient_daily),
         "stickers": channel.pack.count() if channel.pack is not None else 0,
         "generation": getattr(channel.app, "generation", 0),

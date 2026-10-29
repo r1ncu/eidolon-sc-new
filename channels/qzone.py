@@ -236,6 +236,9 @@ class Qzone:
         self._clock = clock or (lambda: datetime.now().astimezone())
         self._rng = rng or random.random
         self._log = log or (lambda line: None)
+        self._last: dict[str, str] = {"why": "", "at": ""}
+        """What the previous tick decided, so 「她今天没发」 can be answered without a log
+        crawl. Memory only: it is a debugging aid, not a decision."""
 
     # ---- what the page and the tests read
 
@@ -275,6 +278,10 @@ class Qzone:
             "today": today,
             "unsupported": bool(self._flag("qzone:unsupported")),
             "count": len(self.recent(50)),
+            # 「为什么今天没发」的答案。带上时间，否则一个两天前的理由看起来像现在的。
+            "last_why": self._last["why"],
+            "last_at": self._last["at"],
+            "now": self._clock().isoformat(timespec="seconds"),
             "recent": [
                 {
                     "content": one.content,
@@ -315,6 +322,10 @@ class Qzone:
             return self._skip("上次没成，还在等", quiet=True)
         if not self._roll(day):
             return self._skip("今天抽到的签是不写", quiet=False)
+        if not getattr(self._client, "connected", True):
+            # 没有 socket 就没有地方发布，而 `compose()` 是一次要花钱的模型调用。断线期间
+            # 每分钟问一次模型再发不出去，是这整条链上最贵的一种空转。
+            return self._skip("还没连上", quiet=True)
 
         try:
             text = await self.compose(now)
@@ -328,9 +339,15 @@ class Qzone:
         return result
 
     def _skip(self, why: str, *, quiet: bool) -> dict[str, Any]:
+        self._note(why)
         if not quiet:
             self._log(f"qq: 空间今天不发（{why}）")
         return {"posted": False, "why": why}
+
+    def _note(self, why: str) -> None:
+        """Remember the last decision for `status()`. Written here rather than at each return
+        so a new early exit cannot forget to say why."""
+        self._last = {"why": why, "at": self._clock().isoformat(timespec="seconds")}
 
     def _roll(self, day: str) -> bool:
         """The day's coin flip, decided once. Rolling per tick would make `chance` a lie:
@@ -420,8 +437,16 @@ class Qzone:
         try:
             tid = await self.publish(text, images=images)
         except PublishError as exc:
+            if exc.kind == "network":
+                # 「还没连上」不是一次发布：它没有内容可判、没有 tid、也没有任何东西到了
+                # 墙上。以前这里会记一条失败并压 RETRY_GAP 小时 —— 于是进程在过了点的
+                # 时候重启一次，第一次 tick 跑在 socket 连上之前，当天就再也不会发了。
+                # 真正的断线会被下一个 tick 再试一次；一分钟的间隔本身就是退避。
+                self._note(f"还没连上（{exc.detail or 'not connected'}）")
+                return {"posted": False, "why": "network", "text": text}
             self._record(text, "", ok=False, error=str(exc), now=now)
             self._set_flag("qzone:fail", now.isoformat(timespec="seconds"))
+            self._note(exc.kind)
             if exc.kind == "unsupported":
                 self._set_flag("qzone:unsupported", now.isoformat(timespec="seconds"))
                 self._log("qq: 空间发不出去 —— 这个 NapCat 没有 send_qzone_msg（升级 NapCat 后会自己重试）")
@@ -435,6 +460,7 @@ class Qzone:
                 self._log(f"qq: 空间发不出去 —— {exc.kind}（{exc.detail}）")
             return {"posted": False, "why": exc.kind, "text": text}
         self._record(text, tid, ok=True, error="", now=now)
+        self._note("发了")
         # One line here rather than at each caller: a post that went out should be readable in
         # the log whichever way it went out, including the hand-sent ones.
         self._log(f"qq: 空间发了 —— {len(text)} 字，{RIGHT.get(self.right, '')}")
