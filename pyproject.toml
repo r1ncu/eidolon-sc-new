@@ -1,6 +1,6 @@
 [project]
 name = "scbot-new"
-version = "1.2.0"
+version = "2.0.1"
 description = "A plugin-kernel chat server: one turn, many plugins, zero dependencies"
 readme = "README.md"
 license = { file = "LICENSE" }
