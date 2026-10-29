@@ -59,7 +59,7 @@ from typing import Any
 from core.events import SegmentComplete, SegmentDelta, TurnDone, TurnFailed, TurnRejected
 from core.llm import ChatMessage
 from core.prompt import Section, Slot
-from core.protocol.reply import unquote
+from core.protocol.reply import PhotoTagged, unquote
 from plugins.affinity import label as tier_label, tier_of
 
 from . import outbox as box
@@ -125,6 +125,19 @@ Night is longer than a workday's by three hours, which is the whole point of a h
 NIGHT_NOTE = """【这个点你已经睡了】现在是 {when}。你早就躺下、已经睡着了，这一条把你吵醒了。
 {how}
 回一句就够了，短。不要展开话题、不要反过来问他在忙什么、不要道歉说自己睡了——你要回去睡。"""
+
+PHOTO_NOTE = """【这个私聊里你可以发图】想让对方看到一张图的时候，把 `<photo>…</photo>` 写在
+**整段回复的最前面**，里面只写这张图拍的是什么（一个短语，别写成长句），程序会照着它把图
+做出来发给他。标记之后照常写你要说的话。
+
+想发才写：说了「给你发一张」却没有标记，是空头支票。大多数时候一句话就够了，不用每张都配。
+图要符合你的身份和这个私聊的分寸。"""
+
+"""Telling her about a capability that only exists when a painter is wired in.
+
+The `<photo>` tag is in the reply format already, so this section teaches the *one* thing the
+protocol cannot: that writing it now actually produces a picture. Saying so when no painter
+exists would be a promise the channel cannot keep, hence the guard at the call site."""
 
 NIGHT_CAP = 6
 """被吵醒以后最多聊几轮。超过这个数就不是「被吵醒」，是半夜聊天了。"""
@@ -317,10 +330,14 @@ class QQChannel:
         clock: Any | None = None,
         log: Any | None = None,
         rng: random.Random | None = None,
+        painter: Any | None = None,
     ) -> None:
         self.app = app
         self.client = client
         self.config = config
+        # 生图的渲染器（`channels.draw`）。`None` = 没有这个功能，协议里的 `<photo>` 照样
+        # 解析、照样存库，只是不会有人去画——和接画家之前一模一样。
+        self.painter = painter
         self.log = log or (lambda line: None)
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         self.identities = identities or Identities(app.store, now=now)
@@ -629,6 +646,66 @@ class QQChannel:
             heard=heard,
             own=own,
         )
+
+    async def _send_picture(self, room: str, tag: str, private: bool) -> bool:
+        """把 `<photo>` 里那句话画出来，发到**私聊**里。
+
+        群里不放行：图比话贵，而且这条能力还在验证阶段。没有画家、标记是空的、这一小时
+        用完了，都是安静地不发——她的正文已经发出去了，多一张少一张不影响那一轮。
+        """
+        if not private or self.painter is None:
+            return False
+        tag = tag.strip()
+        if not tag or self._image_left() <= 0:
+            if tag:
+                self.log("qq: 这一小时的图发完了，先欠着")
+            return False
+        try:
+            data = await self.painter.paint(tag)
+        except Exception as exc:
+            self.log(f"qq: 生图失败（{type(exc).__name__}: {exc}）")
+            return False
+        sent = await self.outbox.send_image(
+            room, "base64://" + base64.b64encode(data).decode("ascii"), private=private
+        )
+        if sent:
+            self._spend_image()
+            self.log(f"qq: 私聊发了一张图（{_clip(tag, 40)}）")
+        return sent
+
+    def _image_left(self) -> int:
+        """这一小时还能发几张（0 表示不限）。"""
+        limit = int(getattr(self.config, "image_hourly", 0) or 0)
+        if limit <= 0:
+            return 10**9
+        try:
+            rows = self.app.store.query(
+                "SELECT value FROM qq_flags WHERE key = ?", (self._image_key(),)
+            )
+            used = int(rows[0]["value"]) if rows else 0
+        except Exception:
+            return limit  # 没有那张表就不要把功能判死
+        return max(0, limit - used)
+
+    def _spend_image(self) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            rows = self.app.store.query(
+                "SELECT value FROM qq_flags WHERE key = ?", (self._image_key(),)
+            )
+            used = int(rows[0]["value"]) if rows else 0
+            self.app.store.execute(
+                "INSERT INTO qq_flags (key, value, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value,"
+                " updated_at = excluded.updated_at",
+                (self._image_key(), str(used + 1), now),
+            )
+        except Exception as exc:
+            self.log(f"qq: 发图次数没记下来（{type(exc).__name__}: {exc}）")
+
+    def _image_key(self) -> str:
+        hour = _local_time(self._clock(), self.app.settings.timezone).strftime("%Y%m%d%H")
+        return f"image:{hour}"
 
     # ---- when she is asleep
 
@@ -1168,6 +1245,9 @@ class QQChannel:
             sections.append(Section(Slot.TURN, FACE_NOTE, title="qq:face"))
         if night:
             sections.append(Section(Slot.TURN, night, order=9, title="qq:night"))
+        if private and self.painter is not None:
+            # 只在私聊告诉她：这条能力现在只在这里放行，群里她写了标记也不会有人画。
+            sections.append(Section(Slot.TURN, PHOTO_NOTE, order=6, title="qq:photo"))
         if self.config.stickers and self.pack is not None and self.pack.favourites():
             # Telling her about a marker that would come back empty is a small lie, and she
             # would keep believing it every turn. Only offered when there is something to send.
@@ -1205,6 +1285,7 @@ class QQChannel:
     ) -> None:
         buffers: dict[int, str] = {}
         spare: dict[int, str] = {}
+        photo_tag: str | None = None
         """The Japanese, kept only as a last resort.
 
         This channel posts the Chinese subtitle, because the room reads Chinese. But the model
@@ -1249,6 +1330,9 @@ class QQChannel:
                             # Not sent now. Only used if the whole reply turns out to have no
                             # Chinese at all — see the `TurnDone` branch below.
                             spare[event.segment] = spare.get(event.segment, "") + event.text
+                    elif isinstance(event, PhotoTagged):
+                        # 她要发图。这句话已经写进 `messages.photo_tag` 了，剩下的是画出来。
+                        photo_tag = event.tag
                     elif isinstance(event, SegmentComplete):
                         piece = buffers.pop(event.segment, "").strip()
                         if piece:
@@ -1299,6 +1383,9 @@ class QQChannel:
                         # not getting to know the person who happened to speak last.
                         if not first and not ambient:
                             self.identities.bump(qq_id)
+                        if photo_tag:
+                            # 话先发，图后到：一张图几十秒，先发图的话那句话要等半天。
+                            await self._send_picture(room, photo_tag, private)
                     elif isinstance(event, TurnRejected):
                         said = texts.line(
                             event.reason, event.retry_after, private=private, refusals=self.refusals

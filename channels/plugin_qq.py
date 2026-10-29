@@ -25,6 +25,7 @@ from . import outbox as box
 from . import qq
 from . import qzone as space
 from . import qzone_reply as replies
+from . import draw
 from . import qzone_web as web
 from . import romance
 from . import stickers as pack
@@ -215,6 +216,16 @@ class QQService(Plugin):
             ),
             outbox=box.Outbox(app.store, self.client.call, log=self._log),
             stickers=self.pack,
+            # 生图：`QQ_IMAGE=1` 且配得出来才有画家，否则 `None`——`channels.draw.make`
+            # 自己判断配没配齐，不把「配了一半」当成「能用」。
+            painter=draw.make(
+                self.config.image_kind,
+                self.config.image_base,
+                self.config.image_key,
+                self.config.image_model,
+            )
+            if self.config.image
+            else None,
             log=self._log,
         )
         # 「她怎么称呼对面」只有一份，频道读过的那个 toml 就是它。
@@ -587,8 +598,9 @@ class QQService(Plugin):
             self._spawn(self._love())
             self._log(
                 f"qq: 恋爱之后她会先发消息（间隔 {self.config.love_ping_min:g}–"
-                f"{self.config.love_ping_max:g} 分钟，只在 "
-                f"{qq.IDLE_QUIET_HOURS[0]}:00–{qq.IDLE_QUIET_HOURS[1]}:00 之间）"
+                f"{self.config.love_ping_max:g} 分钟，只在作息时段——工作日 "
+                f"{qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00、休息日 "
+                f"{qq.HOLIDAY_REST_HOURS[0]}:00–{qq.HOLIDAY_REST_HOURS[1]}:00 以外，日本时间）"
             )
         if self.config.ambient and self.config.ambient_idle > 0 and self.config.groups:
             # Off by default: a bot that starts talking into a quiet room is the feature most
@@ -600,6 +612,12 @@ class QQService(Plugin):
                 f"（工作日 {qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00、"
                 f"休息日 {qq.HOLIDAY_REST_HOURS[0]}:00–{qq.HOLIDAY_REST_HOURS[1]}:00 以外；"
                 f"有人 @ 她照回）"
+            )
+        if self.config.image:
+            # 说清楚是哪一种：假画家出的东西是一块纯色，不是照片。
+            self._log(
+                f"qq: 私聊里她可以发图（{self.config.image_kind}，一小时最多 "
+                f"{self.config.image_hourly or '不限'} 张）"
             )
         if self.config.digest and (
             self.config.digest_dm_days > 0 or self.config.digest_group_days > 0
@@ -894,18 +912,31 @@ class QQService(Plugin):
 
         Split out from the loop so the five cases can be checked without waiting for a clock.
         """
-        start, end = qq.IDLE_QUIET_HOURS
         due = self._love_due()
         if due <= 0:
             return "draw"  # nothing stored: the first draw of this installation
         if due > now.timestamp():
             return "wait"
-        if not start <= now.hour < end:
+        # 作息跟群里是同一套：工作日 23–9、休息日 2–9，按她的时区（日本）。
+        if self.channel.resting(now):
             return "night"
         last = _stamp(self.pack.flag(LOVE_LAST))
         if last and now.timestamp() - last < LOVE_FLOOR:
             return "floor"
         return "fire"
+
+    def _next_awake(self, now: datetime) -> float:
+        """Seconds until the next hour she is awake, plus a few random minutes.
+
+        逐小时往后找，而不是「9 点减现在」：周末她的作息终点是 2 点不是 23 点，
+        节假日还会动。这里问的是 `resting`，日历变了也不用改。
+        """
+        probe = now
+        for _ in range(26):  # 一天之内一定有一个小时她是醒的
+            probe = probe + timedelta(hours=1)
+            if not self.channel.resting(probe):
+                break
+        return (probe - now).total_seconds() + random.uniform(0, 600)
 
     def _love_due(self) -> float:
         """The stored moment the next one is due, or 0 when nothing is stored yet."""
@@ -917,9 +948,8 @@ class QQService(Plugin):
         `until_window` is the night case: the next thing that happens is the window opening,
         not a message, so the gap is not drawn at all — that would waste one per night.
         """
-        start, end = qq.IDLE_QUIET_HOURS
-        if until_window or not start <= now.hour < end:
-            gap = _until(start, now)
+        if until_window or self.channel.resting(now):
+            gap = self._next_awake(now)
         else:
             gap = random.uniform(self.config.love_ping_min, self.config.love_ping_max) * 60
         due = now.timestamp() + gap

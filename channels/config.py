@@ -22,6 +22,17 @@ class QQConfig:
     private: bool = False
     private_ids: tuple[str, ...] = ()
     ignore: tuple[str, ...] = ()
+    image: bool = False
+    image_kind: str = "fake"
+    image_base: str = ""
+    image_key: str = ""
+    image_model: str = ""
+    image_hourly: int = 6
+    """她能不能发图。默认关：图比话贵，也比话更容易出问题。
+
+    现在**只在私聊**放行（`QQ_IMAGE=1`）。`IMAGE_API_KIND=fake` 时不联网，返回一张 1×1
+    的 PNG——先用它把「她写了 `<photo>` → 真的有一张图发过去」这条链路测通；
+    换 `openai` 并补齐 `IMAGE_API_BASE/KEY/MODEL` 才走真的生图服务。"""
     rest_tz: str = "Asia/Tokyo"
     """她的作息按哪个时区算。默认日本（UTC+9）：她是日本人，几点睡是她自己的事，
     不是部署地的事。
@@ -211,6 +222,12 @@ class QQConfig:
             bots=_pairs(env, "QQ_BOTS"),
             # 作息时区：默认日本。只写 `QQ_REST_TZ` 一件事，其余时间仍按 SCCORE_TIMEZONE。
             rest_tz=(env.get("QQ_REST_TZ", "Asia/Tokyo").strip() or "Asia/Tokyo"),
+            image=_flag(env, "QQ_IMAGE", False),
+            image_kind=(env.get("IMAGE_API_KIND", "fake").strip() or "fake"),
+            image_base=env.get("IMAGE_API_BASE", "").strip(),
+            image_key=env.get("IMAGE_API_KEY", "").strip(),
+            image_model=env.get("IMAGE_MODEL", "").strip(),
+            image_hourly=_int(env, "QQ_IMAGE_HOURLY", 6),
             holidays=_list(env, "QQ_HOLIDAYS"),
             workdays=_list(env, "QQ_WORKDAYS"),
             character=(env.get("QQ_CHARACTER") or "").strip(),

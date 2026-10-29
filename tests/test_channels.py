@@ -1946,7 +1946,7 @@ class TestWhenSheWritesFirst(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_draw_is_stored_and_a_restart_keeps_it(self):
         service = await self.service()
-        now = datetime(2026, 10, 26, 14, 0, tzinfo=timezone.utc)  # 中午，开着的时段
+        now = datetime(2026, 10, 26, 14, 0, tzinfo=timezone(timedelta(hours=9)))  # 白天，开着的时段
         due = service._love_draw(now)
         self.assertGreaterEqual(due - now.timestamp(), 60 * 60)
         self.assertLessEqual(due - now.timestamp(), 150 * 60)
@@ -1955,9 +1955,9 @@ class TestWhenSheWritesFirst(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_night_is_pushed_to_the_morning_not_drawn(self):
         service = await self.service()
-        night = datetime(2026, 10, 26, 23, 30, tzinfo=timezone.utc)
+        night = datetime(2026, 10, 26, 23, 30, tzinfo=timezone(timedelta(hours=9)))
         due = service._love_draw(night, until_window=True)
-        when = datetime.fromtimestamp(due, timezone.utc)
+        when = datetime.fromtimestamp(due, night.tzinfo)
         self.assertEqual((when.day, when.hour), (27, 9), "夜里摇一次等于每晚白扔一个间隔")
         # 到点那一刻还在夜里（停机到半夜才活过来）：不写，推到早上。
         service.pack.set_flag("love:next", f"{night.timestamp() - 60:.0f}")
@@ -1965,26 +1965,26 @@ class TestWhenSheWritesFirst(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_gap_that_came_due_while_it_was_down_fires(self):
         service = await self.service()
-        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone(timedelta(hours=9)))
         service.pack.set_flag("love:next", f"{now.timestamp() - 600:.0f}")
         self.assertEqual(service._love_step(now), "fire")
 
     async def test_a_restart_right_after_a_message_does_not_send_twice(self):
         service = await self.service()
-        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone(timedelta(hours=9)))
         service.pack.set_flag("love:last", f"{now.timestamp() - 60:.0f}")
         service.pack.set_flag("love:next", f"{now.timestamp() - 30:.0f}")
         self.assertEqual(service._love_step(now), "floor", "刚发过的，重启也不能再发一条")
 
     async def test_a_fresh_install_has_nothing_stored_and_draws(self):
         service = await self.service()
-        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone(timedelta(hours=9)))
         self.assertEqual(service._love_due(), 0.0)
         self.assertEqual(service._love_step(now), "draw")
 
     async def test_a_future_time_is_only_waited_for(self):
         service = await self.service()
-        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone(timedelta(hours=9)))
         service.pack.set_flag("love:next", f"{now.timestamp() + 1800:.0f}")
         self.assertEqual(service._love_step(now), "wait")
 
@@ -4964,3 +4964,60 @@ class TestTheWokenThread(AmbientCase):
         self.night(day=31)
         await self.say(event("こんばんは", qq="43", message_id="a3"))
         self.assertGreater(len(self.client.texts), before, "新的一觉照常")
+
+
+class TestSheSendsPictures(AmbientCase):
+    """`<photo>` 协议位 → 真的有一张图发到私聊里。
+
+    用假画家（不联网、返回 1×1 PNG）：这条链路要验的是**接线**，不是画得好不好。
+    """
+
+    def paint(self, reply: str, *, fail=None, hourly: int = 6) -> None:
+        from channels.draw import FakePainter
+
+        self.channel.painter = FakePainter(fail=fail)
+        self.channel.config = replace(self.channel.config, image_hourly=hourly)
+        # 引擎是在 App 构造时建好的，换掉 llm 之后要重建，否则用的还是原来那个。
+        self.app.llm = ScriptedLLM(reply)
+        self.app._build_engines()
+
+    def images(self) -> list[str]:
+        return [
+            action
+            for action, params in self.client.calls
+            if action == "send_private_msg"
+            and any(part.get("type") == "image" for part in params.get("message", []))
+        ]
+
+    async def test_a_photo_tag_becomes_a_picture_in_the_dm(self):
+        self.paint("<photo>夜の街</photo><ja>見て</ja><zh>给你看</zh>")
+        await self.channel._turn("42", "42", "制作人", "写真", "", [], private=True)
+        self.assertEqual(self.images(), ["send_private_msg"], "私聊里真的发出了一张图")
+        self.assertEqual(self.channel.painter.asked, ["夜の街"])
+        texts = [t for t in self.client.texts]
+        self.assertIn("给你看", texts, "话照常说，图随后到")
+
+    async def test_a_group_reply_never_paints(self):
+        self.paint("<photo>夜の街</photo><ja>見て</ja><zh>给你看</zh>")
+        await self.channel._turn("100", "43", "路人", "写真", "", [])
+        self.assertEqual(self.client.texts, ["给你看"])
+        self.assertEqual(self.images(), [], "群里不放行")
+        self.assertEqual(self.channel.painter.asked, [], "连画家都不叫")
+
+    async def test_the_hourly_cap_stops_the_second_one(self):
+        self.paint("<photo>a</photo><ja>x</ja><zh>好</zh>", hourly=1)
+        await self.channel._turn("42", "42", "制作人", "1", "", [], private=True)
+        await self.channel._turn("42", "42", "制作人", "2", "", [], private=True)
+        self.assertEqual(self.images(), ["send_private_msg"], "一小时一张")
+
+    async def test_a_broken_painter_costs_nothing(self):
+        self.paint("<photo>a</photo><ja>x</ja><zh>好</zh>", fail=RuntimeError("服务商挂了"))
+        await self.channel._turn("42", "42", "制作人", "1", "", [], private=True)
+        self.assertEqual(self.images(), [])
+        self.assertEqual(self.client.texts, ["好"], "话不能跟着一起丢")
+
+    async def test_no_painter_means_no_picture(self):
+        self.paint("<photo>a</photo><ja>x</ja><zh>好</zh>")
+        self.channel.painter = None
+        await self.channel._turn("42", "42", "制作人", "1", "", [], private=True)
+        self.assertEqual(self.images(), [])
