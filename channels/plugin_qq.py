@@ -597,7 +597,9 @@ class QQService(Plugin):
             self._spawn(self._idle())
             self._log(
                 f"qq: 安静 {int(self.config.ambient_idle)} 分钟以上时，她可能自己开口"
-                f"（{qq.IDLE_QUIET_HOURS[0]}:00–{qq.IDLE_QUIET_HOURS[1]}:00 之间）"
+                f"（工作日 {qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00、"
+                f"休息日 {qq.HOLIDAY_REST_HOURS[0]}:00–{qq.HOLIDAY_REST_HOURS[1]}:00 以外；"
+                f"有人 @ 她照回）"
             )
         if self.config.digest and (
             self.config.digest_dm_days > 0 or self.config.digest_group_days > 0
@@ -938,8 +940,8 @@ class QQService(Plugin):
     async def _maybe_idle(self, now: datetime | None = None) -> bool:
         """`now` is injectable so the quiet hours can be tested without waiting for morning."""
         now = now or datetime.now(_zone(self.app.settings.timezone))
-        start, end = qq.IDLE_QUIET_HOURS
-        if not start <= now.hour < end:
+        # 作息本身在频道里（`resting`）：工作日 23→9，休息日 02→9。这里只问一句。
+        if self.channel.resting(now):
             return False
         said = False
         for group in self.config.groups:

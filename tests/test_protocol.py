@@ -17,6 +17,7 @@ from core.protocol import (
     SpeechDelta,
     format_instructions,
     format_reply,
+    unquote,
     spoken_by,
     voiced,
     without_cues,
@@ -205,3 +206,19 @@ class TestFormatReply(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestUnquote(unittest.TestCase):
+    """整句被引号包住时剥掉；句子里引别人的话不碰。"""
+
+    def test_a_wrapped_line_loses_its_quotes(self):
+        self.assertEqual(unquote("「はい」"), "はい")
+        self.assertEqual(unquote("『はい』"), "はい")
+        self.assertEqual(unquote("「「はい」」"), "はい")
+
+    def test_an_unmatched_mark_is_left_alone(self):
+        self.assertEqual(unquote("「はい"), "「はい")
+        self.assertEqual(unquote("はい」"), "はい」")
+
+    def test_a_quote_inside_the_sentence_survives(self):
+        self.assertEqual(unquote("「はぁ？」って言った"), "「はぁ？」って言った")

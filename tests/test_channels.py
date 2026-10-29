@@ -452,6 +452,9 @@ class ChannelCase(unittest.IsolatedAsyncioTestCase):
             ),
             outbox=self.outbox,
         )
+        # 把钟钉在周五 15:00（日本时间）：作息闸看的是真的钟，不钉住的话整套用例在半夜
+        # 跑就会变成「她睡着了、第一次 @ 不理」。
+        self.channel._clock = lambda: datetime(2026, 10, 30, 6, 0, tzinfo=timezone.utc)
         # Two models, two jobs: the channel's scripted one answers the chat, and this one
         # answers 「她要不要开口、接谁」. A fixture that says yes to everything leaves the
         # gates as the only thing under test, which is what the interjection cases are about;
@@ -971,6 +974,9 @@ class AmbientCase(ChannelCase):
             ambient_heard=8,
             ambient_sticker_p=0.0,
         )
+        # 作息闸看的是真的钟：不钉住的话，这些用例在半夜跑会全部变成「她睡着了」。
+        # 2026-10-30 06:00 UTC = 周五 14:00 北京。
+        self.channel._clock = lambda: datetime(2026, 10, 30, 6, 0, tzinfo=timezone.utc)
 
     async def quiet(self, text: str, *, qq: str = "43", message_id: str = "q1") -> None:
         """A message that does not @ her."""
@@ -1808,8 +1814,10 @@ class TestSpeakingIntoAQuietRoom(AmbientCase):
         await self.quiet("おつかれ", message_id="a")
         self.hours_ago(6)
         self.channel._rng = Coin(0.0, 0.0, 0.0)
-        night = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
-        self.assertFalse(await service._maybe_idle(now=night))
+        # 传进来的是本地时间（`_maybe_idle` 的约定），所以直接写北京的钟点。
+        # 周日 23:30：工作日作息的终点，睡了。休息日的延长见 `TestTheHoursSheKeeps`。
+        night = datetime(2026, 10, 25, 23, 30, tzinfo=timezone.utc)
+        self.assertFalse(await service._maybe_idle(now=night), "睡觉了不开口")
         morning = datetime(2026, 10, 25, 10, 0, tzinfo=timezone.utc)
         self.assertTrue(await service._maybe_idle(now=morning))
 
@@ -3214,6 +3222,8 @@ class TestLadderInChannel(ChannelCase):
         self.assertEqual(self.channel.identities.turns("43"), 1)
 
     async def test_an_interjection_does_not_get_to_know_anyone(self):
+        # 钉在周五下午：作息闸看的是真的钟，半夜跑用例会被「她睡着了」挡掉。
+        self.channel._clock = lambda: datetime(2026, 10, 30, 6, 0, tzinfo=timezone.utc)
         self.channel.config = QQConfig(
             enabled=True, groups=("100",), self_id="999", owners=("42",),
             character="test", merge_seconds=0.0, member_cooldown=0.0,
@@ -4767,3 +4777,190 @@ class TestOnlyChineseReachesTheBubble(ChannelCase):
         prompt = " ".join(str(one.content) for call in self.app.llm.seen for one in call)
         self.assertIn("只有 `<zh>`", prompt)
         self.assertIn("空着就等于", prompt)
+
+
+class TestTheHoursSheKeeps(AmbientCase):
+    """作息：工作日 23–9 睡，休息日拖到 2 点；有人叫她照回，只是语气变成「被吵醒」。
+
+    原来只有「自己开口」那条路径看时间，而且看的是 UTC 的钟：北京时间 11:00 会被当成
+    深夜不开口，18:00 反而可以。看到别人说话就插一句的那条路径**根本没有时间闸**，
+    所以凌晨三点的热闹群里她照样接话。
+    """
+
+    JST = timezone(timedelta(hours=9))
+
+    def local(self, *args) -> datetime:
+        """她的钟是日本的（UTC+9）——她是日本人，几点睡不跟着部署地走。"""
+        return datetime(*args, tzinfo=self.JST)
+
+    def config(self, **overrides) -> None:
+        base = dict(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            character="test", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=True, ambient_p=1.0, ambient_gap=0.0, ambient_check=0.0,
+            ambient_own_p=0.0, ambient_sticker_p=0.0,
+            holidays=("2026-10-01",), workdays=("2026-10-03",),
+        )
+        base.update(overrides)
+        self.channel.config = QQConfig(**base)
+
+    def at(self, *args) -> None:
+        when = self.local(*args).astimezone(timezone.utc)
+        self.channel._clock = lambda: when
+
+    def test_a_workday_night_is_asleep(self):
+        self.config()
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 30, 23, 30)), "周五 23:30")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 30, 8, 59)), "周五早上 8:59")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 30, 22, 30)))
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 30, 9, 0)))
+
+    def test_a_day_off_stays_up_until_two(self):
+        self.config()
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 31, 1, 0)), "周六 1 点还醒着")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 31, 1, 59)))
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 31, 2, 30)))
+
+    def test_a_listed_holiday_is_a_day_off_and_a_listed_saturday_is_not(self):
+        self.config()
+        # 2026-10-01 是周四，但写在 QQ_HOLIDAYS 里 → 按休息日（凌晨一点还醒着）。
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 1, 1, 30)))
+        # 2026-10-03 是周六，但写在 QQ_WORKDAYS 里（调休）→ 按工作日。
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 3, 1, 30)))
+
+    async def test_she_does_not_join_a_room_after_her_bedtime(self):
+        self.config()
+        self.at(2026, 10, 30, 23, 30)
+        await self.quiet("まだ起きてる", message_id="a")
+        await self.quiet("眠れない", message_id="b")
+        self.assertEqual(self.client.texts, [])
+        self.assertEqual(self.channel._ambient_used("100"), 0, "睡着了不花额度")
+
+    async def test_a_call_at_night_is_answered_in_the_woken_up_voice(self):
+        self.config()
+        self.at(2026, 10, 30, 23, 40)
+        # 好感是插件里的数，这里只关心语气，所以直接给一个「亲近」的值。
+        self.channel._affinity = lambda *a, **k: 80.0
+        seen: dict = {}
+        original = self.app.turn
+
+        def spy(*args, **kwargs):
+            seen["sections"] = kwargs.get("sections") or []
+            return original(*args, **kwargs)
+
+        self.app.turn = spy
+        await self.say(event("寝てる？", qq="43", message_id="c"))
+        text = "\n".join(section.text for section in seen["sections"])
+        self.assertIn("这个点你已经睡了", text, "叫醒她这件事要进提示词")
+        self.assertTrue(self.client.texts, "被叫醒也照回")
+
+    def test_the_woken_up_voice_depends_on_how_close_they_are(self):
+        self.config()
+        self.at(2026, 10, 30, 23, 40)
+        far = self.channel._night_note(10)
+        mid = self.channel._night_note(50)
+        close = self.channel._night_note(80)
+        self.assertIn("很不高兴", far, "陌生人：冷、可以直接说不方便")
+        self.assertIn("不耐烦", mid)
+        self.assertIn("抱怨", close, "亲近的人：抱怨其实是担心")
+        self.assertEqual(len({far, mid, close}), 3)
+
+
+class TestQuoteMarks(ChannelCase):
+    """人设文件用「」标例句，模型偶尔把引号写进台词 —— 发出去前剥掉整句外层那一对。"""
+
+    async def test_a_wrapped_line_goes_out_bare(self):
+        await self.channel._emit("100", "43", "「……え、なんの話です？」", "m1", True)
+        self.assertEqual(self.client.texts, ["……え、なんの話です？"])
+
+    async def test_a_quote_inside_the_line_is_left_alone(self):
+        await self.channel._emit("100", "43", "「はぁ？」って言っただけです", "m2", True)
+        self.assertEqual(self.client.texts, ["「はぁ？」って言っただけです"])
+
+
+class TestTheWokenThread(AmbientCase):
+    """被叫醒之后的那几个回合：谁第一声不理、几轮之后她自己说「睡了」。
+
+    这三件事是同一个状态（`rest:<群>:<号>` 一行 JSON），所以测的也是同一件事的三种问法。
+    """
+
+    JST = timezone(timedelta(hours=9))
+
+    def config(self, **overrides) -> None:
+        base = dict(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            character="test", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=False, ambient_idle=0, ambient_p=0.0, ambient_sticker_p=0.0,
+        )
+        base.update(overrides)
+        self.channel.config = QQConfig(**base)
+
+    def night(self, hour: int = 23, minute: int = 40, day: int = 30) -> None:
+        when = datetime(2026, 10, day, hour, minute, tzinfo=self.JST).astimezone(timezone.utc)
+        self.channel._clock = lambda: when
+
+    def capture(self) -> list[str]:
+        seen: list[str] = []
+        original = self.app.turn
+
+        def spy(*args, **kwargs):
+            seen.append("\n".join(section.text for section in kwargs.get("sections") or []))
+            return original(*args, **kwargs)
+
+        self.app.turn = spy
+        return seen
+
+    async def test_a_distant_person_is_ignored_the_first_time(self):
+        """疏远的人：睡着了第一声当作没听见，连续再叫一次才睁眼。"""
+        self.config()
+        self.night()
+        await self.say(event("ねえ", qq="43", message_id="n1"))
+        self.assertEqual(self.client.texts, [], "第一次不理")
+        await self.say(event("ねえってば", qq="43", message_id="n2"))
+        self.assertTrue(self.client.texts, "第二次才回")
+
+    async def test_somebody_she_trusts_is_answered_at_once(self):
+        self.config()
+        self.night()
+        self.channel._affinity = lambda *a, **k: 60.0
+        await self.say(event("起きてる？", qq="43", message_id="n3"))
+        self.assertTrue(self.client.texts)
+
+    async def test_she_ends_it_on_the_round_the_dice_says(self):
+        self.config()
+        self.night()
+        self.channel._affinity = lambda *a, **k: 80.0
+        self.channel._rng = Coin(0.5)  # 1 + int(0.5 * 6) = 4
+        seen = self.capture()
+
+        for index in range(4):
+            await self.say(event(f"ねえ{index}", qq="43", message_id=f"t{index}"))
+        self.assertIn("第 4 轮", seen[-1])
+        self.assertIn("最后一轮", seen[-1])
+
+        before = len(self.client.texts)
+        await self.say(event("まだ起きてる？", qq="43", message_id="t9"))
+        self.assertEqual(len(self.client.texts), before, "说睡了之后就真的不回")
+
+    async def test_the_budget_never_exceeds_six_rounds(self):
+        self.channel._rng = Coin(0.999)
+        _speak, _turn, ends = self.channel._night_visit("100", "43", 80.0)
+        self.assertLessEqual(ends, 6)
+        self.assertEqual(ends, 6, "骰子最大也只到六轮")
+
+    async def test_a_new_sleep_starts_from_zero(self):
+        self.config()
+        self.night()
+        self.channel._affinity = lambda *a, **k: 80.0
+        self.channel._rng = Coin(0.0)  # 1 轮就结束
+        await self.say(event("ねえ", qq="43", message_id="a1"))
+        self.assertTrue(self.client.texts)
+        before = len(self.client.texts)
+        await self.say(event("もう一声", qq="43", message_id="a2"))
+        self.assertEqual(len(self.client.texts), before, "这一觉结束了")
+
+        # 第二天晚上同一觉之外：账本按「醒来的那天」编号，所以重新开始。
+        self.channel._rng = Coin(0.5)
+        self.night(day=31)
+        await self.say(event("こんばんは", qq="43", message_id="a3"))
+        self.assertGreater(len(self.client.texts), before, "新的一觉照常")

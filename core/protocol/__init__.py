@@ -21,6 +21,7 @@ from .reply import (
     SpeechDelta,
     format_instructions,
     format_reply,
+    unquote,
 )
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "SpeechDelta",
     "format_instructions",
     "format_reply",
+    "unquote",
     "register_directed_reader",
     "spoken_by",
     "voiced",

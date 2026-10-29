@@ -22,6 +22,20 @@ class QQConfig:
     private: bool = False
     private_ids: tuple[str, ...] = ()
     ignore: tuple[str, ...] = ()
+    rest_tz: str = "Asia/Tokyo"
+    """她的作息按哪个时区算。默认日本（UTC+9）：她是日本人，几点睡是她自己的事，
+    不是部署地的事。
+
+    只影响「作息」这一件事（工作日 23–9、休息日 2–9 不主动开口），不影响额度、空间日历
+    这些跟这边的人有关的东西——那些仍然按 `SCCORE_TIMEZONE`。"""
+    holidays: tuple[str, ...] = ()
+    workdays: tuple[str, ...] = ()
+    """哪些日子按「节假日」算、哪些按「上班」算（`YYYY-MM-DD`，逗号分隔）。
+
+    周末自动算休息日；这两个列表只用来纠正日历说不清的那几天：国庆、春节这类连休，
+    以及调休上班的周六。它只影响**她主动开口的时段**——工作日 23:00 之后闭嘴，休息日
+    可以拖到 02:00，像一个人第二天不用早起。有人 @ 她、或者私聊，任何时间都回，
+    只是语气会变成「被吵醒」那一档。"""
     bots: tuple[tuple[str, str], ...] = ()
     """哪些 QQ 号是别的角色的机器人：`QQ_BOTS=3824843517=luca`（号码=角色 id，逗号分隔）。
 
@@ -195,6 +209,10 @@ class QQConfig:
             private_ids=_list(env, "QQ_PRIVATE_IDS"),
             ignore=_list(env, "QQ_IGNORE_IDS"),
             bots=_pairs(env, "QQ_BOTS"),
+            # 作息时区：默认日本。只写 `QQ_REST_TZ` 一件事，其余时间仍按 SCCORE_TIMEZONE。
+            rest_tz=(env.get("QQ_REST_TZ", "Asia/Tokyo").strip() or "Asia/Tokyo"),
+            holidays=_list(env, "QQ_HOLIDAYS"),
+            workdays=_list(env, "QQ_WORKDAYS"),
             character=(env.get("QQ_CHARACTER") or "").strip(),
             merge_seconds=_float(env, "QQ_MERGE_SECONDS", 1.2),
             member_cooldown=_float(env, "QQ_MEMBER_COOLDOWN", 20.0),

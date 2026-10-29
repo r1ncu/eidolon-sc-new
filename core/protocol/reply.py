@@ -295,6 +295,21 @@ class ReplyParser:
         return events
 
 
+_WRAPPERS = (("「", "」"), ("『", "』"), ("“", "”"), ('"', '"'))
+"""Quote marks that can end up around a whole line. The persona file quotes every example
+this way for legibility (「はぁ？」「プロデューサーさん」), and the model now and then copies
+the mark into the sentence itself — 5 of 663 segments, measured. A line of dialogue is what
+she *said*: the quotes make it look like she is reading somebody else's words back."""
+
+
+def unquote(text: str) -> str:
+    """Drop the quote marks that wrap the line, and only those."""
+    text = text.strip()
+    while len(text) >= 2 and any(text[0] == open_ and text[-1] == close for open_, close in _WRAPPERS):
+        text = text[1:-1].strip()
+    return text
+
+
 def format_reply(
     segments: list[Segment], photo_tag: str | None = None, photo_failed: bool = False
 ) -> str:
@@ -303,7 +318,9 @@ def format_reply(
     `status="failed"`."""
     marked = ' status="failed"' if photo_failed else ""
     photo = f"<{_PHOTO}{marked}>{photo_tag}</{_PHOTO}>" if photo_tag is not None else ""
-    return photo + "".join(f"<ja>{s.ja}</ja><zh>{s.zh}</zh>" for s in segments)
+    return photo + "".join(
+        f"<ja>{unquote(s.ja)}</ja><zh>{unquote(s.zh)}</zh>" for s in segments
+    )
 
 
 def _partial_suffix(text: str, tags: tuple[str, ...]) -> int:

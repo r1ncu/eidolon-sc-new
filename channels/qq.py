@@ -59,7 +59,8 @@ from typing import Any
 from core.events import SegmentComplete, SegmentDelta, TurnDone, TurnFailed, TurnRejected
 from core.llm import ChatMessage
 from core.prompt import Section, Slot
-from plugins.affinity import label as tier_label
+from core.protocol.reply import unquote
+from plugins.affinity import label as tier_label, tier_of
 
 from . import outbox as box
 from . import romance
@@ -109,7 +110,42 @@ often: a room where she fills every pause is worse than one where she never does
 
 IDLE_QUIET_HOURS = (9, 23)
 """The hours she will start a conversation of her own in, local time. Night is quiet on
-purpose — a bot that says something of its own at four in the morning is a bot you mute."""
+purpose — a bot that says something of its own at four in the morning is a bot you mute.
+
+Kept for the private-chat ping (which is a different thing from a room) — the rooms read
+`QQChannel.resting`, which knows about weekends and holidays."""
+
+REST_HOURS = (23, 9)
+"""Workday sleep, local time: 23:00 → 09:00."""
+
+HOLIDAY_REST_HOURS = (2, 9)
+"""The same on a day off: she stays up to two, like a person who does not have work tomorrow.
+Night is longer than a workday's by three hours, which is the whole point of a holiday."""
+
+NIGHT_NOTE = """【这个点你已经睡了】现在是 {when}。你早就躺下、已经睡着了，这一条把你吵醒了。
+{how}
+回一句就够了，短。不要展开话题、不要反过来问他在忙什么、不要道歉说自己睡了——你要回去睡。"""
+
+NIGHT_CAP = 6
+"""被吵醒以后最多聊几轮。超过这个数就不是「被吵醒」，是半夜聊天了。"""
+
+NIGHT_TURN = """这是今晚被叫醒之后的第 {turn} 轮，你打算在第 {ends} 轮把这次对话结束掉。
+{how}"""
+
+NIGHT_ENDING = """这一轮就是最后一轮：说完就去睡（「もう寝るね」「明天再说」这种），不要再留问题、
+不要答应明天几点、不要让他觉得还能接着聊。"""
+
+NIGHT_MORE = """还没到结束的那一轮：每句都短，不要展开，也不要反过来问他在忙什么。"""
+
+NIGHT_FAR = """被吵醒让你很不高兴：语气冷、短，可以直接说「这个点不方便」。不要撒娇，不要关心对方。"""
+
+NIGHT_TRUST = """你有点不高兴，但还是回了一句：短，听得出一点不耐烦，答完就想继续睡。"""
+
+NIGHT_CLOSE = """你嘴上抱怨这个点还不睡、明天打算怎么办，其实是担心。可以软一点，但别聊起来。"""
+
+# 同样的三更半夜，三种关系：陌生人听到「这个点不方便」，信任的人听到一句不耐烦的短句，
+# 亲近的人听到的抱怨其实是担心。分档直接用 `plugins.affinity` 的，所以她说话的口径和
+# 页面上那个数字是一致的。
 
 OWN_NUDGE = "（没有人叫你。你想说什么就说什么，不必接他们的话。）"
 """What stands in the user's place when the turn is a thought of her own.
@@ -507,6 +543,9 @@ class QQChannel:
         """
         if not self.config.ambient:
             return
+        if self.resting():
+            # 她睡着了。群里就算聊到天亮也不插话——这是「作息」，不是「不感兴趣」。
+            return
         lines = self._heard.get(group)
         if not lines:
             return
@@ -590,6 +629,120 @@ class QQChannel:
             heard=heard,
             own=own,
         )
+
+    # ---- when she is asleep
+
+    def resting(self, now: datetime | None = None) -> bool:
+        """Whether this is an hour she would not be awake for.
+
+        Two schedules, because a person has two: a workday ends at eleven, a day off does
+        not. Weekends count as days off; `QQ_HOLIDAYS` / `QQ_WORKDAYS` override the calendar
+        for the days it disagrees with itself (国庆、调休上班的周六).
+
+        Only answers one question — 「主动开口要不要闭嘴」。有人叫她就照回，只是语气不一样
+        （见 `_night_note`）：一条 @ 在凌晨被吞掉，比被吵醒更像坏掉。
+        """
+        local = _local_time(now or self._clock(), self.config.rest_tz)
+        day = local.strftime("%Y-%m-%d")
+        off = day in self.config.holidays or (
+            local.weekday() >= 5 and day not in self.config.workdays
+        )
+        start, end = HOLIDAY_REST_HOURS if off else REST_HOURS
+        hour = local.hour
+        return (hour >= start or hour < end) if start > end else (start <= hour < end)
+
+    def _night_note(self, value: float, turn: int = 0, ends: int = 0) -> str:
+        """The line that goes into the prompt when a reply has just woken her up.
+
+        `turn` / `ends` are this sleep's budget: the model is told which round this is and
+        which one has to be the last, because 「她会不会自己结束」 is not something a
+        character can decide consistently across six turns without being told.
+        """
+        when = _local_time(self._clock(), self.config.rest_tz)
+        band = tier_of(value)
+        if band in ("close", "intimate"):
+            how = NIGHT_CLOSE
+        elif band == "trust":
+            how = NIGHT_TRUST
+        else:
+            how = NIGHT_FAR
+        text = NIGHT_NOTE.format(when=f"{when:%H:%M}", how=how)
+        if turn and ends:
+            text += "\n" + NIGHT_TURN.format(
+                turn=turn, ends=ends, how=NIGHT_ENDING if turn >= ends else NIGHT_MORE
+            )
+        return text
+
+    def _rest_window(self, local: datetime) -> tuple[str, datetime]:
+        """(哪一觉, 几点醒). 用「醒来的那天」当编号：一夜之间只认这一觉。"""
+        if local.hour >= REST_HOURS[0]:
+            wake = (local + timedelta(days=1)).replace(
+                hour=REST_HOURS[1], minute=0, second=0, microsecond=0
+            )
+        else:
+            wake = local.replace(hour=REST_HOURS[1], minute=0, second=0, microsecond=0)
+        return wake.strftime("%Y-%m-%d"), wake
+
+    def _rest_state(self, key: str) -> dict[str, Any]:
+        try:
+            rows = self.app.store.query("SELECT value FROM qq_flags WHERE key = ?", (key,))
+        except Exception:  # 没有那张表（channel 单独跑）也得能说话
+            return {}
+        if not rows:
+            return {}
+        try:
+            data = json.loads(rows[0]["value"] or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _rest_save(self, key: str, state: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            self.app.store.execute(
+                "INSERT INTO qq_flags (key, value, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value,"
+                " updated_at = excluded.updated_at",
+                (key, json.dumps(state, ensure_ascii=False), now),
+            )
+        except Exception as exc:  # 记不住就算了，不能因为记账把这一轮带走
+            self.log(f"qq: 今晚这几轮没记下来（{type(exc).__name__}: {exc}）")
+
+    def _night_visit(self, scope: str, qq_id: str, value: float) -> tuple[bool, int, int]:
+        """这一次深夜的 @ 要不要开口，以及这是第几轮、第几轮结束。
+
+        三件事是同一个状态：`rest:<scope>:<qq>` 一行 JSON
+        `{"w": 这一觉的编号, "t": 已经到第几轮, "n": 抽到的结束轮, "z": 已经睡了}`。
+        换一觉自动从头开始，不需要任何人清理。
+
+        疏远（好感 <40）的人第一次 @ 不回：睡着了第一声当作没听见。连续再叫一次才睁眼，
+        而且结束轮最早也只能落在第二次——否则「第一次不回」和「第一轮就结束」互相矛盾。
+        """
+        local = _local_time(self._clock(), self.config.rest_tz)
+        window, _wake = self._rest_window(local)
+        key = f"rest:{scope}:{qq_id}"
+        state = self._rest_state(key)
+        if str(state.get("w")) != window:
+            state = {
+                "w": window,
+                "t": 0,
+                "n": min(NIGHT_CAP, 1 + int(self._rng.random() * NIGHT_CAP)),
+            }
+        if state.get("z"):
+            return False, 0, 0  # 这一觉已经结束了，天亮前不再开口
+        ends = int(state.get("n") or 1)
+        distant = value < 40
+        if distant:
+            ends = max(ends, 2)
+        turn = int(state.get("t") or 0) + 1
+        state["t"], state["n"] = turn, ends
+        if distant and turn < 2:
+            self._rest_save(key, state)
+            return False, 0, 0
+        if turn >= ends:
+            state["z"] = True
+        self._rest_save(key, state)
+        return True, turn, ends
 
     # ---- the day's quota
 
@@ -845,7 +998,14 @@ class QQChannel:
         text = "\n".join(words).strip()
         if not text and not pictures:
             return
-        if not private and qq_id not in self.config.owners and self._cooling(key):
+        # 夜里放行同一个人连着 @：睡眠账本自己会封顶（最多六轮就睡），而「连续两次才理」
+        # 这条规则需要第二次真的走到这里——被群里那套冷却挡掉，就永远等不到。
+        if (
+            not private
+            and qq_id not in self.config.owners
+            and self._cooling(key)
+            and not self.resting()
+        ):
             # The cooldown is for a room of fifty: one member must not be able to hold the
             # floor. It is not for the producer — 「@ 了两次，第二次没有回」 is the exact bug
             # this looked like from the outside, and the second line was a real question.
@@ -891,6 +1051,18 @@ class QQChannel:
         user_id = self.identities.resolve(
             qq_id, card=card, role="owner" if role == OWNER else "member"
         )
+        # 有人把她叫醒了：这一次要不要回、这是第几轮、回完该不该睡。
+        # 放在最前面：睡着了的那几次连模型都不叫。
+        night = ""
+        if not ambient and self.resting():
+            value = self._affinity(user_id, DM_SURFACE if private else GROUP_SURFACE)
+            scope = "_dm" if private else room
+            speak, turn, ends = self._night_visit(scope, qq_id, value)
+            if not speak:
+                self.log(f"qq: 这个点没有回（{qq_id}，{scope}）")
+                return
+            night = self._night_note(value, turn, ends)
+
         # How well she knows them is a number, and it goes up by one per answer. The first
         # thing she ever says to a stranger is therefore the sweet, formal voice; the same
         # person thirty answers later gets the one she uses when she has stopped performing.
@@ -994,6 +1166,8 @@ class QQChannel:
             # Only when one was actually sent. What a marker means is a fact about QQ, not
             # about her, so it belongs here rather than in a character's stage file.
             sections.append(Section(Slot.TURN, FACE_NOTE, title="qq:face"))
+        if night:
+            sections.append(Section(Slot.TURN, night, order=9, title="qq:night"))
         if self.config.stickers and self.pack is not None and self.pack.favourites():
             # Telling her about a marker that would come back empty is a small lie, and she
             # would keep believing it every turn. Only offered when there is something to send.
@@ -1185,6 +1359,8 @@ class QQChannel:
         because nobody asked her."""
         address = not private and not ambient
         piece, sticker = split_mark(piece)
+        # 「」/『』 包住的整句：人设文件用引号标例句，模型偶尔把引号一起写进台词。
+        piece = unquote(piece)
         if piece:
             await self.outbox.send(
                 room,
@@ -2157,6 +2333,28 @@ def _character_name(app: Any, character_id: str) -> str:
         return str(app.characters.character(character_id).name)
     except Exception:
         return ""
+
+
+_FIXED_HOURS = {"Asia/Tokyo": 9, "Asia/Shanghai": 8, "UTC": 0}
+"""两个不带夏令时的时区，写死偏移。
+
+`ZoneInfo` 要有系统时区库（Linux 有，某些机器上要装 `tzdata`）。装不上时退回这里，
+而不是退回「跑代码的这台机器的时区」—— 后者会让她在开发机上 23:30 醒着、在服务器上
+23:30 睡着，同一个时间两种行为。日本和中国都没有夏令时，写死是准确的。"""
+
+
+def _local_time(now: datetime, tz: str | None) -> datetime:
+    """The same instant, on the clock where she lives."""
+    name = tz or "UTC"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return now.astimezone(ZoneInfo(name))
+    except Exception:
+        hours = _FIXED_HOURS.get(name)
+        if hours is not None:
+            return now.astimezone(timezone(timedelta(hours=hours)))
+        return now.astimezone()
 
 
 def _local_day(now: datetime, tz: str | None) -> str:
