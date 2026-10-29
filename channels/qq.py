@@ -785,7 +785,9 @@ class QQChannel:
         except Exception as exc:  # 记不住就算了，不能因为记账把这一轮带走
             self.log(f"qq: 今晚这几轮没记下来（{type(exc).__name__}: {exc}）")
 
-    def _night_visit(self, scope: str, qq_id: str, value: float) -> tuple[bool, int, int]:
+    def _night_visit(
+        self, scope: str, qq_id: str, value: float, *, owner: bool = False
+    ) -> tuple[bool, int, int]:
         """这一次深夜的 @ 要不要开口，以及这是第几轮、第几轮结束。
 
         三件事是同一个状态：`rest:<scope>:<qq>` 一行 JSON
@@ -794,7 +796,12 @@ class QQChannel:
 
         疏远（好感 <40）的人第一次 @ 不回：睡着了第一声当作没听见。连续再叫一次才睁眼，
         而且结束轮最早也只能落在第二次——否则「第一次不回」和「第一轮就结束」互相矛盾。
+
+        制作人不受这个限制：他和别处一样有豁免（群里不占冷却、不占额度、留言排最前）。
+        半夜的私聊不该骰子一摇就断掉——他找得到她，她就一直回，只是语气是「被吵醒」那一档。
         """
+        if owner:
+            return True, 0, 0
         local = _local_time(self._clock(), self.config.rest_tz)
         window, _wake = self._rest_window(local)
         key = f"rest:{scope}:{qq_id}"
@@ -1134,7 +1141,9 @@ class QQChannel:
         if not ambient and self.resting():
             value = self._affinity(user_id, DM_SURFACE if private else GROUP_SURFACE)
             scope = "_dm" if private else room
-            speak, turn, ends = self._night_visit(scope, qq_id, value)
+            speak, turn, ends = self._night_visit(
+                scope, qq_id, value, owner=(role == OWNER)
+            )
             if not speak:
                 self.log(f"qq: 这个点没有回（{qq_id}，{scope}）")
                 return

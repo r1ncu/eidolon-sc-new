@@ -4965,6 +4965,16 @@ class TestTheWokenThread(AmbientCase):
         await self.say(event("こんばんは", qq="43", message_id="a3"))
         self.assertGreater(len(self.client.texts), before, "新的一觉照常")
 
+    async def test_the_producer_is_not_cut_off_mid_night(self):
+        """制作人不受「随机结束」那一套：他和别处一样有豁免。"""
+        self.config()
+        self.night()
+        self.channel._rng = Coin(0.0)  # 骰子说第一轮就结束
+        for index in range(3):
+            await self.say(event(f"ねえ{index}", qq="42", message_id=f"o{index}"))
+        # 每轮两段（假模型给的是两句话），三轮六条。
+        self.assertEqual(len(self.client.texts), 6, "他一直问，她就一直回")
+
 
 class TestSheSendsPictures(AmbientCase):
     """`<photo>` 协议位 → 真的有一张图发到私聊里。
