@@ -11,6 +11,7 @@
 cp characters/characters.example.toml characters/characters.toml
 cp characters/units.example.toml      characters/units.toml     # 可选
 mkdir -p characters/sheets characters/avatars characters/world
+mkdir -p characters/works && cp characters/work.example.toml characters/works/<作品id>.toml  # 可选
 ```
 
 然后写 `characters.toml` 里那几条，`sheet` 指向的人设文件放 `characters/sheets/<id>.md`。
@@ -22,6 +23,7 @@ mkdir -p characters/sheets characters/avatars characters/world
 | 位置 | 必需 | 作用 |
 |---|---|---|
 | `characters.toml` | **是** | 角色表：id、名字、颜色、人设路径，以及恋爱系统的三个数 |
+| `works/<id>.toml` | 否 | 作品表：标题、事务所、话题词。一个作品一份，**平级**；角色用它区分归属 |
 | `units.toml` | 否 | 组合表，只影响对话列表的分组与搜索候选 |
 | `sheets/<id>.md` | 是 | 人设正文。会进提示词的 persona 槽，按角色缓存 |
 | `avatars/<id>.jpg` | 否 | 头像。没有就是没有，不报错 |
@@ -60,7 +62,8 @@ mkdir -p characters/sheets characters/avatars characters/world
 
 ```
 characters/
-  work.toml                 # 作品：标题、事务所、聊到作品本身时的关键词（共享，一份）
+  works/<id>.toml           # 作品：标题、事务所、聊到作品本身时的关键词。一个作品一份，彼此平级
+  work.toml                 # 单作品简写：`works/` 为空时才读，不是「主作品」
   world/
     work.md                 # 作品的客观事实（共享；没有任何第一人称）
     office.md               # 名单：谁、在哪个组合、一句话（共享）
@@ -70,14 +73,23 @@ characters/
     facts.md                # 角色资料（旧位置 facts/<id>.md 仍然认）
     view.md                 # **她怎么叫这些人、谁在她心里什么位置**（没有共享版本）
     world.md                # **她怎么看这个作品**（没有共享版本）
+    names.toml              # 自称、怎么叫对面、哪些名字算她（旧 stage.toml 里那段）
     voice/qq.md dm.md stage.toml refusals.toml interests.md qzone.md
+    voice/tease.toml        # 她自己的特别设定：机制要的数据（记号、额度、那一句）
+    voice/tease.md          # 同一件事的人设段落，语域里的 {{extra}} 是它的位置
     relations.toml stories.toml facts-stories/ assets/ memory/
+    facts-live.md           # 资料：现实公演的年表（给人读的提炼稿，不注入）
+    facts-live/             # 资料：那份年表的来源 `sc-events.csv`
 ```
+
+- `facts-live` 是**语料**不是设定：`stories.toml` 里「现实企划的演出」那几段是从它提炼的，
+  提示词用的是 `facts-stories/05-演出与活动/`，这两份只在读文件时给人看。
 
 - 前两层是「世界」，最后那一层是「她」。**两条线成对注入**：只有事实，她是在念维基；
   只有视角，她没有可以站的地方。
 - 解析顺序：先 `packs/<id>/…`，再旧的扁平名（`world/<id>-qq.md` 等）。所以可以把一个人
-  慢慢搬过去，中间不会坏。
+  慢慢搬过去，中间不会坏。搬完以后 `pack.summary()` 里 `fallback` 是空的——那是「一个人的
+  东西全在自己包里」的判据。
 - 启动那一行会告诉你读了什么：
 
   ```
@@ -86,6 +98,24 @@ characters/
 
   文件缺了不会报错（有中性退路），这一行是让「用错文件」看得见的地方。
 - `/我说过`（私聊）用的是同一条路：角色的名字、卡名的署名，都从包里来。
+
+## SCSP 素材：头像与聊天背景
+
+官方 SCSP 那套图有两个用途，各自的开关都在「设置 → 外观」：
+
+| 文件 | 管什么 | 开关 |
+|---|---|---|
+| `avatars/<id>.jpg` | 头像（列表、气泡旁边） | SCSP 头像 |
+| `avatars-scsp/<id>.jpg` | SCSP 头像的另一版 | SCSP 头像（打开后用这一版） |
+| `backgrounds/<id>.jpg` | 对话页的壁纸（`SfpChainProfileBg_<Name>.png` 那套） | SCSP 聊天背景 |
+
+- 三个都在 `characters.toml` 里有对应的一行（`avatar` / `scsp_avatar` / `background`），
+  按角色取，缺哪个就是没有那一样，页面自己退成印象色。
+- 图片放进角色包也认：`packs/<id>/assets/{avatar,scsp,background}.*`，包里的优先。
+- 后缀不用管：`.jpg` / `.png` / `.jpeg` / `.webp` 都认，条目里写着的那个优先——官方给的
+  背景是 PNG，写 `backgrounds/<id>.jpg` 也不会因为后缀对不上就说「没有」。
+- 壁纸是**铺在对话页最底下**的，顶部压了一层她的印象色，标题才看得清；气泡本身不透明，
+  所以不挡字。
 
 ## 日历：她什么时候睡
 

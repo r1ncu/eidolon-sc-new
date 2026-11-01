@@ -46,6 +46,7 @@ from plugins.quota import Quota
 from plugins.recall import DEFAULT_MODEL, OpenAIEmbeddings, Recall
 from plugins.status import ServiceStatus
 from plugins.stories import Stories
+from plugins.tease import Tease
 from plugins.voice import Voice
 
 USER_NAME = "制作人"
@@ -85,8 +86,9 @@ class App:
             base_url=settings.base_url, api_key=settings.api_key, model=settings.model
         )
         self.llm = chat
-        # 作品是共享的（`characters/work.toml`），两个插件的提示里各有一处提到它——
-        # 它们是「这个 deployment 在演什么」，不是「这个人是谁」，所以从这里注入。
+        # 判官开场和记忆抽取各有一处要提「作品」。它们不针对某一位角色，所以拿的是
+        # 「整台部署只有一个作品时的那个」——有多个作品时这里是空的，措辞退回中性，
+        # 不把某一个作品当成所有人的出处。
         self.affinity = Affinity(
             self.store,
             labels=self.characters.name_of,
@@ -110,6 +112,17 @@ class App:
             exempt=lambda turn: bool(turn.facts.get("quota.exempt")),
         )
         self.status = ServiceStatus(self.store)
+        # 夹子的逐句许可：判官每轮回答「这一句是不是在逗她」，通道数着「这十条夹过没夹过」，
+        # 两者都对上才给一句「这一句可以夹」。额度与许可分离——规则层的「可以」实测推不动
+        # 她（四批二十句 0/5），逐句判才推得动。
+        # 角色是哪一个由 QQ 通道说了算（`channels/config.py` 的 `character`），这里拿不到，
+        # 所以给的是取角色包的函数：判官那一句「可以夹」要看**这个人设**有没有这份规则。
+        self.tease = Tease(
+            self.store,
+            tier=lambda uid, cid: self.affinity.tier(uid, cid, surface="group"),
+            character=self.qq_character,
+            pack=self.characters.pack,
+        )
         # 资料有两种用法（原版只有后者）：`whole` 是整份 `facts/<id>.md` 跟着人设一起进提示词、
         # 一起缓存；`vector` 是切段嵌入、每轮只带最近的几段。向量版没有嵌入服务就退回整份，
         # 因为「话照说」比「说了但少了资料」重要。
@@ -170,6 +183,7 @@ class App:
             self.profile,
             self.voice,
             self.status,
+            self.tease,
         ]
         if self.gifts is not None:
             plugins.append(self.gifts)
@@ -206,6 +220,16 @@ class App:
         self._build_engines()
         self.generation += 1
         return True
+
+    def qq_character(self) -> str:
+        """Who this deployment is playing, or "" before the channel exists.
+
+        The kernel does not know the QQ account's character — that lives in the channel's
+        own config (`QQ_CHARACTER`), and the channel is the last plugin started. Everything
+        that needs it reads it through here, so nothing has to be constructed twice.
+        """
+        config = getattr(getattr(self.qq, "channel", None), "config", None)
+        return str(getattr(config, "character", "") or "")
 
     def _build_engines(self) -> None:
         """The engines, built **when somebody asks for one**.
@@ -311,7 +335,9 @@ class App:
             # 作品（共享）与每人一份的角色包：页面要把「这份人设是从哪读的」显示出来，
             # 否则换角色之后「语气怪」只能靠猜。`tell` 是 brief + pack，字段只增不改。
             "work": self.characters.work.as_dict(),
-            "characters": [self.characters.tell(c) for c in self.characters.roster],
+            "characters": [
+                {**self.characters.tell(c), **_urls(c)} for c in self.characters.roster
+            ],
             "capabilities": capabilities,
             "affinity": self.affinity.read(self.user_id, character.id).as_dict(),
             "memories": self.memory.everything(self.user_id),
@@ -831,13 +857,22 @@ def _at(value: object) -> str:
     return text or datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _brief(character: Character) -> dict:
+def _urls(character: Character) -> dict:
+    """Where the page fetches her pictures.
+
+    两张头像和一张壁纸的地址必须**两边都有**：`contentArea()` 是从 `characters` 列表里
+    取出这一位来画对话页的，所以列表项少了这几个键，对话框里就没有头像、也铺不上壁纸——
+    而 `character` 那个单数对象是给别处用的，补它不解决问题。
+    """
     return {
-        **character.brief(),
         "avatar_url": f"/media/avatar/{character.id}" if character.avatar else "",
         "scsp_avatar_url": f"/media/avatar/{character.id}?set=scsp" if character.scsp_avatar else "",
-        "voice_id": character.voice_id,
+        "background_url": f"/media/background/{character.id}" if character.background else "",
     }
+
+
+def _brief(character: Character) -> dict:
+    return {**character.brief(), **_urls(character), "voice_id": character.voice_id}
 
 
 def _message(message) -> dict:  # noqa: ANN001 - core.messages.Message

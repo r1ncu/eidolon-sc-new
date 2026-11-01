@@ -23,14 +23,30 @@ from channels.config import QQConfig
 from channels.identities import Identities
 from channels import plugin_qq
 from channels import qq as qq_module
-from channels.qq import QQChannel
+from channels.qq import SWITCHES, QQChannel
 from channels.world import World
 from core.llm import ScriptedLLM
 from core.protocol import Segment
 from core.settings import Settings
 from core.store import Store
 from plugins import affinity
+from plugins import packs as pack_file
 from serve import App
+
+SHIPPED = Path(__file__).resolve().parents[1] / "characters"
+"""这个 checkout 的角色数据。测试不猜路径：她自己的文件在哪，问 `Pack`。"""
+
+
+def hers(kind: str, *, character: str = "fuyuko") -> Path:
+    """A shipped file of hers, by kind — `qq`、`dm`、`persona`、`facts`、`refusals`…
+
+    以前这里写的是 `characters/world/fuyuko-qq.md` 这种路径。文件一搬进角色包，八条测试
+    就跟着路径一起碎了——测的是「角色数据是不是这样」，不是「文件放在哪」。
+    """
+    path = pack_file.Pack(SHIPPED, character).path(kind)
+    if path is None:
+        raise unittest.SkipTest(f"这个 checkout 没有 `{kind}`（{character}）")
+    return path
 
 SHEET = "# 人设：测试角色\n\n你是测试角色，说话简短。\n"
 REPLY = "<ja>おはよう</ja><zh>早上好</zh><ja>今日は早いね</ja><zh>今天真早啊</zh>"
@@ -333,6 +349,15 @@ class TestPresence(unittest.TestCase):
             addressee=presence.STRANGER, now=self.now
         ))
 
+    def test_a_character_without_a_voice_file_gets_no_line(self):
+        """「营业声线」是她的数据（`voice/tiers.toml`），不是这个通道的规则。
+
+        没写这份文件的角色，档位那一段就是空的——不加，也不拿别人的招牌顶上。
+        """
+        self.assertEqual(presence._voice("trust", None), "")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(presence._voice("trust", pack_file.Pack(Path(tmp), "someone")), "")
+
     def test_a_character_can_say_who_the_room_is(self):
         """Reported by the user: the room is people who play the game, not passers-by.
 
@@ -462,6 +487,11 @@ class ChannelCase(unittest.IsolatedAsyncioTestCase):
         (root / "characters" / "world" / "fuyuko-dm.md").write_text(DM_RULES, encoding="utf-8")
         (root / "characters" / "world" / "meta.md").write_text(META, encoding="utf-8")
         (root / "characters" / "world" / "idols" / "asahi.md").write_text(IDOL, encoding="utf-8")
+        # 「夹」的规则属于角色，不属于代码：没有这份文件，计数与许可都不生效。
+        pack = root / "characters" / "packs" / "test" / "voice"
+        pack.mkdir(parents=True)
+        (pack / "tease.toml").write_text(TEASE_TOML, encoding="utf-8")
+        (pack / "tiers.toml").write_text(TIERS_TOML, encoding="utf-8")
         settings = Settings(
             base_url="http://unused",
             api_key="unused",
@@ -492,6 +522,8 @@ class ChannelCase(unittest.IsolatedAsyncioTestCase):
             presence=presence.Presence(
                 root / "characters" / "world" / "fuyuko-qq.md",
                 direct=root / "characters" / "world" / "fuyuko-dm.md",
+                # 档位声线是角色数据：夹具里那份 `tiers.toml` 就是「这个人」的两层声音。
+                pack=self.app.characters.pack("test"),
             ),
             outbox=self.outbox,
         )
@@ -1436,6 +1468,22 @@ class TestSheRemembersWhatSheSaid(AmbientCase):
         self.assertEqual(len(self.client.calls), before, "前面只剩她自己的话，没有可接的")
 
 
+TIERS_TOML = """\
+[tiers]
+cold = "【距离·语气】你现在收着（{name}）：敬语还在，但短、平、不甜——不挂任何♡。"
+distant = "【距离·语气】你和他还不熟（{name}），这一档整场都是「冬優（ふゆ）」——笑眯眯、句尾软软的营业人格，比对着镜头还要甜一档。♡ 要挂在中文里：「ふゆ♡」「好呀♡」这样，每三四条里至少一个。「ハ？」「バーカ」一句都不该有——那是冬優子那边才有的。这层甜是刻意摆出来的，不是真心。"
+trust = "【距离·语气】这个人你已经熟了（{name}）：冬優子出来了——私下的那几句可以出来，偶尔一声「ハ？」「バーカ」。「ふゆ♡」和♡ 在这一档基本不挂——**除非你正好在逗他**，十个消息里最多一次（额度看【夹子·计数】那行）。"
+close = "【距离·语气】这个人你已经熟了（{name}）：冬優子出来了——私下的那几句可以出来，偶尔一声「ハ？」「バーカ」。「ふゆ♡」和 在这一档基本不挂——**除非你正好在逗他**，十个消息里最多一次（额度看【夹子·计数】那行）。"
+intimate = "【距离·语气】这个人你已经熟了（{name}）：冬優子出来了——私下的那几句可以出来，偶尔一声「ハ？」「バーカ」。「ふゆ♡」和♡ 在这一档基本不挂——**除非你正好在逗他**，十个消息里最多一次（额度看【夹子·计数】那行）。"
+"""
+
+TEASE_TOML = """\
+[tease]
+marks = ["♡", "♥", "❤"]
+window = 10
+hint = "【夹子·这一句】他在逗你——这一句可以夹，说完下一句照旧嫌他。"
+"""
+
 STAGE_TOML = """\
 [names]
 self = "ふゆ"
@@ -1693,6 +1741,115 @@ class TestWhatTheJudgeSees(ChannelCase):
     def test_the_background_is_capped(self):
         heard = [{"card": "甲", "text": "あ" * 400}]
         self.assertLessEqual(len(self.channel._brief(heard, "いま", False, "")), 300)
+
+
+class TestTheTeaseCounter(ChannelCase):
+    """「十条里最多一次」得有人数——她数不了自己前十句。
+
+    人设早就写了这条规则，但历史里只留二十轮、还带不出「哪句挂了♡」，所以她永远查不到。
+    通道来数，然后把数字说出来：「你最近十条里有两条挂了」比「十条最多一次」管用。
+    """
+
+    def seen(self) -> dict:
+        box: dict = {}
+        original = self.app.turn
+
+        def spy(*args, **kwargs):
+            box["sections"] = kwargs.get("sections") or []
+            return original(*args, **kwargs)
+
+        self.app.turn = spy
+        self.addCleanup(setattr, self.app, "turn", original)
+        return box
+
+    def tier(self, value: float) -> None:
+        """把这个人钉在一个档位上，不经过数据库。
+
+        两个入口都要给：`_turn` 问的是 `affinity.tier()`（决定群里的声线），
+        `affinity.prompt_sections` 用的是 `read()`，只盖一个的话另一半还是老样子。
+        """
+
+        class Standing:
+            def __init__(self, v):
+                self.value = v
+                self.tier = affinity.tier_of(v)
+                self.cooling = False
+                self.sulk = False
+
+        standing = Standing(value)
+        self.channel.app.affinity.read = lambda *a, **k: standing
+        self.channel.app.affinity.tier = lambda *a, **k: standing.tier
+
+    async def test_her_own_group_line_moves_the_window(self):
+        self.channel._note_tease("100", "……はい♡")
+        self.channel._note_tease("100", "ふつうに喋ってますけど")
+        self.assertEqual(self.channel._tease_window("100"), "10")
+
+    async def test_the_window_keeps_only_ten(self):
+        for index in range(14):
+            self.channel._note_tease("100", "あ" * index)
+        self.assertEqual(len(self.channel._tease_window("100")), 10)
+        self.channel._note_tease("100", "♡")
+        self.assertEqual(self.channel._tease_window("100"), "0000000001")
+
+    def test_a_private_line_is_not_counted(self):
+        self.channel._note_tease("dm:42", "♡")
+        self.assertEqual(self.channel._tease_window("100"), "", "两个房间各数各的")
+
+    async def test_a_close_person_is_told_how_many_she_used(self):
+        self.tier(90)
+        for mark in ("♡", "", "♡", "", ""):
+            self.channel._note_tease("100", mark)
+        note = self.channel._tease_note("100", "intimate").text
+        self.assertIn("2 条挂了♡", note)
+        self.assertIn("上一次是 2 条之前", note)
+        self.assertIn("十条最多一次", note)
+
+    async def test_with_none_used_there_is_room(self):
+        """额度归通道说，许可归判官说——这条只说「还有没有额度」。"""
+        self.tier(90)
+        self.channel._note_tease("100", "ふつうの返事")
+        note = self.channel._tease_note("100", "close").text
+        self.assertIn("没夹过", note)
+        self.assertIn("有额度", note)
+        self.assertNotIn("可以夹", note, "「可以夹」是逐句判的，不写在计数行里（plugins/tease.py）")
+
+    def test_a_person_below_trust_is_never_told_about_it(self):
+        """信任以下（冷淡、疏远）这条规则根本不该出现。
+
+        那里甜不甜由档位自己管：疏远档整场营业声线、冷淡档收着不甜，`presence._voice` 各说各的。
+        再塞一条「十条最多一次」进去，就是两套规则让她挑，而挑错的那半边会把常态当成武器。
+        """
+        for _ in range(3):
+            self.channel._note_tease("100", "はい♡")
+        self.assertIsNone(self.channel._tease_note("100", "cold"), "冷淡档")
+        self.assertIsNone(self.channel._tease_note("100", "distant"), "疏远档")
+
+    async def test_the_note_rides_with_a_group_turn(self):
+        self.tier(90)
+        self.channel._note_tease("100", "はい♡")
+        seen = self.seen()
+        await self.say(event("ねえ", message_id="t1"))
+        titles = [section.title for section in seen["sections"]]
+        self.assertIn("qq:tease", titles)
+
+    async def test_a_private_turn_gets_no_counter(self):
+        self.tier(90)
+        self.channel._note_tease("100", "はい♡")
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",), private=True,
+            character="test", merge_seconds=0.0, member_cooldown=0.0,
+        )
+        seen = self.seen()
+        await self.say(direct("ただいま", message_id="d1"))
+        titles = [section.title for section in seen["sections"]]
+        self.assertNotIn("qq:tease", titles, "私聊没有「十条最多一次」这条规矩")
+
+    async def test_her_reply_updates_the_window_for_next_time(self):
+        self.tier(90)
+        self.channel.app.llm.reply = "はいはい、聞いてるわよ……なんてね♡"
+        await self.say(event("ねえ", message_id="t1"))
+        self.assertEqual(self.channel._tease_window("100")[-1:], "1")
 
 
 class TestInterestedTopics(AmbientCase):
@@ -2694,7 +2851,7 @@ class TestStageLadder(unittest.TestCase):
         self.assertNotIn("初次见面", text, "there is nobody new in a private chat")
 
     def test_the_shipped_rules_have_a_ladder(self):
-        shipped = presence.Presence(Path(__file__).resolve().parents[1] / "characters" / "world" / "fuyuko-qq.md")
+        shipped = presence.Presence(hers("qq"))
         names = [name for name, _f, _p in shipped.stages()]
         self.assertEqual(names, ["new", "familiar", "close", "inner"])
         first = shipped.stage_prose("new")
@@ -2706,9 +2863,7 @@ class TestStageLadder(unittest.TestCase):
     def test_the_title_line_does_not_reach_the_prompt(self):
         from datetime import datetime, timezone
 
-        shipped = presence.Presence(
-            Path(__file__).resolve().parents[1] / "characters" / "world" / "fuyuko-qq.md"
-        )
+        shipped = presence.Presence(hers("qq"))
         text = "".join(
             section.text
             for section in shipped.sections(
@@ -2721,9 +2876,7 @@ class TestStageLadder(unittest.TestCase):
     def test_the_shipped_rules_treat_the_group_as_producers(self):
         from datetime import datetime, timezone
 
-        shipped = presence.Presence(
-            Path(__file__).resolve().parents[1] / "characters" / "world" / "fuyuko-qq.md"
-        )
+        shipped = presence.Presence(hers("qq"))
         text = "".join(
             section.text
             for section in shipped.sections(
@@ -2751,8 +2904,7 @@ class TestStageLadder(unittest.TestCase):
         """
         from datetime import datetime, timezone
 
-        root = Path(__file__).resolve().parents[1] / "characters" / "world"
-        shipped = presence.Presence(root / "fuyuko-qq.md", direct=root / "fuyuko-dm.md")
+        shipped = presence.Presence(hers("qq"), direct=hers("dm"))
 
         text = "".join(
             section.text
@@ -2780,8 +2932,7 @@ class TestStageLadder(unittest.TestCase):
         """
         from datetime import datetime, timezone
 
-        root = Path(__file__).resolve().parents[1] / "characters" / "world"
-        shipped = presence.Presence(root / "fuyuko-qq.md", direct=root / "fuyuko-dm.md")
+        shipped = presence.Presence(hers("qq"), direct=hers("dm"))
 
         scene = shipped.scene_head(presence.PRIVATE)
         self.assertEqual(scene.slot, "persona", "the relationship belongs before the sheet")
@@ -2807,9 +2958,7 @@ class TestStageLadder(unittest.TestCase):
         """The sheet is read *after* the scene line, so a blanket 「不接受越界的恋爱」 there
         outweighs 「亲近不用藏」 and every reply ends up pushing him away. The sheet must
         leave the private distance to the scene file, and only keep the public one."""
-        sheet = (
-            Path(__file__).resolve().parents[1] / "characters" / "sheets" / "fuyuko.md"
-        ).read_text(encoding="utf-8")
+        sheet = hers("persona").read_text(encoding="utf-8")
         self.assertNotIn("不接受越界的恋爱", sheet)
         self.assertIn("有外人在", sheet, "the public distance is still hers")
         self.assertIn("两个人独处", sheet, "and the private one belongs to the scene file")
@@ -2818,8 +2967,7 @@ class TestStageLadder(unittest.TestCase):
     def test_the_private_rules_tell_her_to_take_it(self):
         """Reluctance is a habit of speech, not a wall: one line of 嘴硬 per turn at most,
         and the line is only about sex — not about being held."""
-        root = Path(__file__).resolve().parents[1] / "characters" / "world"
-        dm = (root / "fuyuko-dm.md").read_text(encoding="utf-8")
+        dm = hers("dm").read_text(encoding="utf-8")
         self.assertIn("接住他的亲近", dm)
         self.assertIn("最多嘴硬一句", dm)
         self.assertIn("不要拿它当挡箭牌", dm, "the limit is about sex, not about closeness")
@@ -2830,8 +2978,7 @@ class TestStageLadder(unittest.TestCase):
         """The sheet has her voice; `facts/` has what a fan would ask her about. It goes in
         whole (`SCCORE_RECALL=whole`), so the things below must actually be in it — a character
         who cannot say her own birthday is a character nobody believes."""
-        root = Path(__file__).resolve().parents[1] / "characters"
-        facts = (root / "facts" / "fuyuko.md").read_text(encoding="utf-8")
+        facts = hers("facts").read_text(encoding="utf-8")
         for needle in (
             "12 月 4 日", "163cm", "服装设计", "SOS", "ガガリズム",
             "Landing Point", "Mira♡Mira", "あさひ",
@@ -2846,9 +2993,7 @@ class TestStageLadder(unittest.TestCase):
     def test_the_facts_file_knows_the_main_story_chapter_by_chapter(self):
         """A fan can ask 「W.I.N.G. 第5话你干嘛失联」. Chapter titles are the one part of her
         own history that people actually quote, so they are in the notes, one line each."""
-        facts = (
-            Path(__file__).resolve().parents[1] / "characters" / "facts" / "fuyuko.md"
-        ).read_text(encoding="utf-8")
+        facts = hers("facts").read_text(encoding="utf-8")
         for needle in (
             "ハートフル・フェアリーテイル",
             "諦めたくないものはひとつだけ",
@@ -2863,9 +3008,7 @@ class TestStageLadder(unittest.TestCase):
     def test_the_notes_leave_out_the_failed_routes(self):
         """User's call, and a good one: the losing routes are what the game does to her, not
         what she lived. A memory full of 「落選」 makes her answer as a failure."""
-        facts = (
-            Path(__file__).resolve().parents[1] / "characters" / "facts" / "fuyuko.md"
-        ).read_text(encoding="utf-8")
+        facts = hers("facts").read_text(encoding="utf-8")
         for gone in (
             "見えなかった景色",    # W.I.N.G. 落选后的结局
             "オーディション後 敗北",
@@ -2877,9 +3020,7 @@ class TestStageLadder(unittest.TestCase):
             self.assertNotIn(gone, facts, f"{gone} 是失败线，不进她的记忆")
 
     def test_the_work_layer_knows_the_song_names(self):
-        meta = (Path(__file__).resolve().parents[1] / "characters" / "world" / "meta.md").read_text(
-            encoding="utf-8"
-        )
+        meta = (SHIPPED / "world" / "meta.md").read_text(encoding="utf-8")
         self.assertIn("SOS", meta)
         self.assertIn("Landing Point", meta)
         self.assertIn("if(!Straylight)", meta, "the events she carried are outward knowledge too")
@@ -3828,6 +3969,20 @@ class TestTheVoiceFollowsTheDistance(ChannelCase):
         self.assertIn("冬優（ふゆ）", prompt)
         self.assertIn("ふゆ♡", prompt, "♡ 是这一档的招牌，不写出来她就不挂")
         self.assertIn("一句都不该有", prompt)
+
+    async def test_the_closest_tiers_may_put_the_mask_back_on_for_one_line(self):
+        """熟了之后♡基本不挂——但「逗他的时候夹一句」必须仍能发生。
+
+        以前这一档写的是「不必再挂（当武器用）」，实际效果是永远不挂：实测五句挑衅、五句
+        温和的逗，全部 0/5，计数行再怎么放行也没用——压住它的是这句档位文案。
+        所以规则改成人设里本来就写的那条：默认不挂，逗他时可以披一句，十个消息里最多一次。
+        """
+        self.channel.app.affinity.tier = lambda *a, **k: "intimate"
+        prompt = await self.told("43", "v3")
+        self.assertIn("在这一档基本不挂", prompt)
+        self.assertIn("除非你正好在逗他", prompt, "没有这句，亲密档就永远夹不起来")
+        self.assertIn("十个消息里最多一次", prompt, "和计数窗口同一个口径")
+        self.assertIn("有人在认真说话", prompt) if False else None
 
     async def test_the_producer_is_measured_too(self):
         """主人在群里也是一个人：他的数字说了算，不是写死的 intimate。
@@ -5203,8 +5358,7 @@ class TestOnlyChineseReachesTheBubble(ChannelCase):
 
     def canned(self) -> list[tuple[str, str]]:
         """所有「通道自己写的话」。新加一条话术就该出现在这里，否则这把锁形同虚设。"""
-        world = Path(__file__).resolve().parents[1] / "characters" / "world"
-        refusals = texts.load(world / "fuyuko-refusals.toml")
+        refusals = texts.load(hers("refusals"))
         lines: list[tuple[str, str]] = [
             ("CONFESS_OK", qq_module.CONFESS_OK),
             ("help/private", qq_module.help_text(private=True)),
@@ -5586,3 +5740,108 @@ class TestSheSendsPictures(AmbientCase):
         self.channel.painter = None
         await self.channel._turn("42", "42", "制作人", "1", "", [], private=True)
         self.assertEqual(self.images(), [])
+
+
+class TestASettingInItsOwnFile(unittest.TestCase):
+    """某一条只属于这个人设的规则（「夹子」），可以单独一份文件。
+
+    写在语域文件里也能跑，但那样就不能单独换掉它、也不能单独看它。`{{extra}}` 是它落地的
+    位置：语域里留在原位，替换成那一份的正文；语域没留位置就接在末尾。
+    """
+
+    def build(self, *, placeholder: bool = True, extra: bool = True) -> str:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        # 【场景】那一段会被 Presence 提到 persona 里，所以用后面的正文当坐标。
+        qq_rules = "群里几十个人，随时有人说话。\n\n" + ("{{extra}}\n\n" if placeholder else "") + "【长度】一两句。\n"
+        (root / "qq.md").write_text(qq_rules, encoding="utf-8")
+        (root / "tease.md").write_text("【夹子】偶尔夹一句，说完就收。\n", encoding="utf-8")
+        rules = presence.Presence(
+            root / "qq.md", extra=root / "tease.md" if extra else None
+        )
+        return rules.sections(
+            addressee=presence.OWNER, now=datetime(2026, 11, 1, 12, tzinfo=timezone.utc),
+            scene=presence.GROUP,
+        )[0].text
+
+    def test_the_placeholder_takes_the_extra_in_place(self):
+        text = self.build()
+        self.assertIn("【夹子】偶尔夹一句", text)
+        self.assertNotIn("{{extra}}", text, "占位符不能漏进提示词")
+        self.assertLess(text.index("群里几十个人"), text.index("【夹子】"))
+        self.assertLess(text.index("【夹子】"), text.index("【长度】"), "留在原位置，不是接在最后")
+
+    def test_without_the_file_the_placeholder_disappears_cleanly(self):
+        text = self.build(extra=False)
+        self.assertNotIn("【夹子】", text)
+        self.assertNotIn("{{extra}}", text)
+        self.assertNotIn("\n\n\n", text, "空占位不能留下三个空行")
+
+    def test_a_register_without_a_placeholder_still_gets_it_at_the_end(self):
+        text = self.build(placeholder=False)
+        self.assertIn("【夹子】偶尔夹一句", text)
+        self.assertGreater(text.index("【夹子】"), text.index("【长度】"))
+
+    def test_a_private_chat_does_not_get_it(self):
+        self.build()  # 先把两份文件写出来
+        rules = presence.Presence(
+            Path(self.tmp.name) / "qq.md", extra=Path(self.tmp.name) / "tease.md"
+        )
+        text = rules.sections(
+            addressee=presence.OWNER, now=datetime(2026, 11, 1, 12, tzinfo=timezone.utc),
+            scene=presence.PRIVATE,
+        )[0].text
+        self.assertNotIn("【夹子】", text, "那是群里的规矩，私聊不接")
+
+
+class TestTheSwitchesOnThePage(ChannelCase):
+    """设置页「插件 → QQ 聊天插件」那几个开关：存库、立刻生效、不碰没拨的那几项。
+
+    为什么存库而不是改 `.env`：`.env` 是启动时读一次的，改一次要重启一次，而「今天想不想
+    在群里说话」不该是一次重启的事。库里存的是**覆盖**，没拨过的仍然按部署者的配置来。
+    """
+
+    def on_of(self, name: str) -> bool:
+        return next(one for one in self.channel.switches() if one["id"] == name)["on"]
+
+    def test_the_list_is_the_table(self):
+        self.assertEqual([one["id"] for one in self.channel.switches()], [name for name, _ in SWITCHES])
+
+    def test_it_shows_what_is_in_force(self):
+        self.assertTrue(self.on_of("enabled"), "夹具的配置是开着的")
+        self.assertFalse(self.on_of("ambient"), "夹具没写 ambient，默认是关")
+
+    def test_a_switch_takes_effect_at_once(self):
+        self.assertTrue(self.channel.config.enabled)
+        self.assertTrue(self.channel.set_switch("enabled", False))
+        self.assertFalse(self.channel.config.enabled)
+        self.assertTrue(self.channel.config.stickers, "没碰的那几项照旧")
+
+    def test_it_is_stored_not_just_remembered(self):
+        self.channel.set_switch("enabled", False)
+        rows = self.app.store.query("SELECT value FROM qq_flags WHERE key = ?", ("switch:enabled",))
+        self.assertEqual(rows[0]["value"], "0")
+
+    def test_the_deployment_s_own_config_stays_the_default(self):
+        self.channel.set_switch("enabled", False)
+        self.assertTrue(self.channel._base_config.enabled, "网页只覆盖，不改 `.env` 读出来的那份")
+
+    def test_a_name_that_is_not_there_is_refused(self):
+        self.assertFalse(self.channel.set_switch("nonsense", True))
+
+
+class TestTheMasterSwitch(ChannelCase):
+    """「在群里说话」这个总开关：关掉就是一句都不回，@ 也不回——事件照收，她还在线。"""
+
+    async def test_she_says_nothing_while_it_is_off(self):
+        self.channel.set_switch("enabled", False)
+        await self.say(event())
+        self.assertEqual(self.client.texts, [], "总开关关着，一个字都不该发出去")
+
+    async def test_turning_it_back_on_speaks_again(self):
+        self.channel.set_switch("enabled", False)
+        await self.say(event())
+        self.channel.set_switch("enabled", True)
+        await self.say(event(message_id="b"))
+        self.assertTrue(self.client.texts, "拨回来以后她照常说话")

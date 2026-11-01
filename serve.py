@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,7 @@ from app import App
 from core.events import PluginEvent, SegmentDelta, TurnDone, TurnFailed, TurnRejected
 from core.llm import ScriptedLLM
 from core.settings import Settings, load_env
+from web_compat import serve_compat
 
 HERE = Path(__file__).parent
 PAGE = HERE / "web" / "index.html"
@@ -91,6 +93,7 @@ def make_handler(app: App, page: bytes, extra_routes: dict | None = None) -> typ
     plugin, and that is cheaper than a fake plugin.
     """
     routes = {**app.host.routes(), **(extra_routes or {})}
+    page_redirect = (os.environ.get("SCCORE_WEB_REDIRECT") or "").strip()
     media_root = Path(app.settings.media).resolve()
     characters = app.characters
 
@@ -126,6 +129,11 @@ def make_handler(app: App, page: bytes, extra_routes: dict | None = None) -> typ
             path = parsed.path
             query = _flat(parsed.query)
             if path in PAGE_ROUTES or path.startswith("/conversation/") or path.startswith("/settings/"):
+                # 两份前端合成一份以后，这一份只当门房：把人和他正在看的那一页原样送过去
+                # （`SCCORE_WEB_REDIRECT`，见 .env）。不配这个变量就还是老样子，自己画。
+                if page_redirect:
+                    self._redirect(page_redirect.rstrip("/") + self.path)
+                    return
                 self._send(200, _page_html(), "text/html; charset=utf-8")
                 return
             if path.startswith("/assets/"):
@@ -133,6 +141,9 @@ def make_handler(app: App, page: bytes, extra_routes: dict | None = None) -> typ
                 return
             if path.startswith("/media/avatar/"):
                 self._avatar(path[len("/media/avatar/") :].split("?")[0], scsp="set=scsp" in (parsed.query or ""))
+                return
+            if path.startswith("/media/background/"):
+                self._background(path[len("/media/background/") :].split("?")[0])
                 return
             if path.startswith("/media/"):
                 self._photo(path[len("/media/") :])
@@ -261,6 +272,14 @@ def make_handler(app: App, page: bytes, extra_routes: dict | None = None) -> typ
                 return
             self._file(path, cache="public, max-age=86400")
 
+        def _background(self, character_id: str) -> None:
+            """她的对话页壁纸。和头像一样按角色取，换了角色就是换一张。"""
+            path = characters.background(character_id)
+            if path is None:
+                self._json({"error": "没有聊天背景"}, status=404)
+                return
+            self._file(path, cache="public, max-age=86400")
+
         def _photo(self, name: str) -> None:
             path = app.photos.path(name)
             if path is None:
@@ -286,6 +305,13 @@ def make_handler(app: App, page: bytes, extra_routes: dict | None = None) -> typ
             # must not keep serving yesterday's build out of its cache.
             cache = "no-store" if target.suffix.lower() in (".js", ".css", ".html") else "public, max-age=86400"
             self._file(target, cache=cache, kind=kind)
+
+        def _redirect(self, to: str) -> None:
+            """301 而不是 302：两边是同一份东西，这条路径永远该去那边，顺手让浏览器记住。"""
+            self.send_response(301)
+            self.send_header("Location", to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def _file(self, path: Path, *, cache: str, kind: str | None = None) -> None:
             try:
@@ -355,6 +381,12 @@ def main() -> None:
     parser.add_argument("--host", default=None)
     parser.add_argument("--env", default=str(HERE / ".env"))
     parser.add_argument("--fake", action="store_true", help="用假模型跑：不需要 key，只说一段固定台词")
+    parser.add_argument(
+        "--compat-port",
+        type=int,
+        default=None,
+        help="同时用原版网页的接口再开一个端口（`web_compat.py`）：原版 Next.js 前端要用它",
+    )
     options = parser.parse_args()
 
     load_env(options.env)
@@ -376,16 +408,28 @@ def main() -> None:
         make_handler(app, PAGE.read_bytes()),
     )
     server.daemon_threads = True
+    compat_port = options.compat_port or int(os.environ.get("SCCORE_COMPAT_PORT") or 0)
+    compat = None
+    if compat_port:
+        # 原版网页（Next.js）说的是另一套接口，见 `web_compat.py`。和主站同一个进程、
+        # 同一个 App：两边改的是同一份库，不会出现「网页看到的」和「QQ 看到的」不一致。
+        compat = serve_compat(app, settings.host, compat_port)
+        threading.Thread(target=compat.serve_forever, daemon=True).start()
     print(
         f"scbot-new  ←  http://{settings.host}:{settings.port}  "
         f"（{len(app.characters.roster)} 位角色 / {', '.join(app.host.names)} / {settings.model}）"
     )
+    if compat is not None:
+        print(f"原版接口  ←  http://{settings.host}:{compat_port}  （给原版网页用）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
     finally:
         server.server_close()
+        if compat is not None:
+            compat.shutdown()
+            compat.server_close()
         app.host.close()
         app.close()
 

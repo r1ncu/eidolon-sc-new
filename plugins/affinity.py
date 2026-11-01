@@ -58,10 +58,11 @@ LOWEST, HIGHEST = 0.0, 100.0
 LEVEL_STEPS = (-5.0, -2.0, 0.0, 0.5, 1.0)
 """How much a turn changes it by the level judged, from hurting her (0) to very happy (4).
 
-The two happy levels are 0.5 and 1 rather than 1 and 2: a group has no day limit on gains
-(see `change`), so the per-turn step is the only brake left in a room — at +2 she went from
-「陌生」 to 「信任」 in ten good turns, which is one evening. A private chat is capped at 6 a
-day anyway, so this halves that room's ceiling too, from six points to three.
+The two happy levels are 0.5 and 1 rather than 1 and 2: a room moves faster than a private
+chat (fifty people, and ten points of gains a day instead of six), and the per-turn step is
+the other brake — at +2 a member went from 「陌生」 to 「信任」 in ten good turns, which is one
+evening. A private chat is capped at 6 a day, so this halves that room's ceiling too, from
+six points to three.
 """
 
 NO_EFFECT = 2
@@ -77,6 +78,17 @@ Beijing's days whatever their own zone. 不要跟着 `SCCORE_TIMEZONE` 走——
 
 GAINS_PER_DAY = 6.0
 """How much turns can raise it in a day, in a private chat."""
+
+GAINS_PER_DAY_GROUP = 10.0
+"""How much turns can raise it in a day, in a room.
+
+It used to have no ceiling at all, on the argument that conversation is the only thing that
+can move it there (no gifts), so a cap would mean a room could be talked to all evening and
+gain nothing. True, and the reason the step is 0.5 rather than 2 — but 「no ceiling」 is not
+「a bigger ceiling」: at +0.5/+1 a turn, one busy evening walked a member from 「疏远」 to
+「亲近」, and the number stopped meaning anything anyone had earned. Ten is a room's day:
+roughly twice a private chat's six, because a room has fifty people in it and one of them is
+allowed to be more interesting than the others."""
 
 SULK_LINE = 70.0
 """In a relationship: below this, one wrong sentence starts a sulk; back at it, the sulk lifts.
@@ -348,7 +360,7 @@ class Affinity(Plugin):
         work: object | None = None,
     ) -> None:
         self._store = store
-        # 判官读到的第一句原本写死《偶像大师 闪耀色彩》。那是「作品」，从 `work.toml` 来；
+        # 判官读到的第一句原本写死《偶像大师 闪耀色彩》。那是「作品」，从 `works/<id>.toml` 来；
         # 没有作品信息时退成中性的一句——**不能**默认成某个具体作品，那正是通用版的漏洞。
         title = getattr(work, "name", None)
         house = getattr(work, "house", None)
@@ -566,15 +578,18 @@ class Affinity(Plugin):
         said. Either way the line wins: a number back over `SULK_LINE` lifts it, because the
         whole point of the state is that it ends when the relationship is repaired.
 
-        The day's ceiling is the same rule in both rooms. It exists because gifts are the
-        other way a number moves, and a day that counts both has to stop somewhere.
+        The day's ceiling is the same rule in both rooms, at two sizes. It exists because
+        gifts are the other way a number moves, and a day that counts both has to stop
+        somewhere: six in a private chat, ten in a room (see `GAINS_PER_DAY_GROUP`).
         """
         now = self._clock()
         before, gained, gained_on = self._row(user_id, character_id, now, surface)
         today = day_of(now).isoformat()
         gained_today = gained if gained_on == today else 0.0
         if step > 0:
-            ceiling = GAINS_PER_DAY
+            ceiling = (
+                GAINS_PER_DAY_GROUP if self._scene(surface) == "group" else GAINS_PER_DAY
+            )
             step = min(step, max(ceiling - gained_today, 0.0))
         after = before.stepped(step)
         kept_sulk = before.sulk if sulk is None else sulk

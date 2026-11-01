@@ -91,6 +91,17 @@ class TestPack(unittest.TestCase):
         write(self.root, "sheets/fuyuko.md")
         self.assertTrue(packs.Pack(self.root, "fuyuko").compact()["ready"])
 
+    def test_present_says_what_is_actually_there(self):
+        # 「世界观」那一页要把二十项摊开：有的打勾，没有的打叉。`missing` 只说缺什么，
+        # 所以另给一份 `present`——页面不必自己拿 _LAYOUT 反推。
+        write(self.root, "sheets/fuyuko.md", "人设")
+        write(self.root, "backgrounds/fuyuko.jpg")
+        compact = packs.Pack(self.root, "fuyuko").compact()
+        self.assertIn("persona", compact["present"])
+        self.assertIn("background", compact["present"])
+        self.assertNotIn("qq", compact["present"])
+        self.assertEqual(len(compact["present"]) + len(compact["missing"]), len(packs._LAYOUT))
+
     def test_a_declared_home_is_used_and_nothing_else_changes(self):
         write(self.root, "somewhere/else/persona.md", "人设")
         pack = packs.Pack(self.root, "fuyuko", declared="somewhere/else")
@@ -137,3 +148,112 @@ class TestCardTails(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheSettingThatHasItsOwnFile(unittest.TestCase):
+    """「夹子」这类只属于某个人设的设定，是包里的一份文件，不是代码里的默认值。
+
+    `tease` 是机制要的数据（记号、窗口、那句话），`tease-md` 是她自己的人设段落：
+    语域文件里留一个 `{{extra}}`，那一段就落在那里。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_both_halves_are_found_in_the_pack(self):
+        write(self.root, "packs/x/voice/tease.toml", '[tease]\nmarks = ["♡"]\n')
+        write(self.root, "packs/x/voice/tease.md", "【夹子】偶尔夹一句。")
+        pack = packs.Pack(self.root, "x")
+        self.assertEqual(pack.path("tease"), self.root / "packs/x/voice/tease.toml")
+        self.assertEqual(pack.path("tease-md"), self.root / "packs/x/voice/tease.md")
+        self.assertEqual(pack.text("tease-md"), "【夹子】偶尔夹一句。")
+
+    def test_a_character_without_it_simply_has_none(self):
+        write(self.root, "packs/x/voice/qq.md", "群聊语域")
+        pack = packs.Pack(self.root, "x")
+        self.assertIsNone(pack.path("tease-md"))
+        self.assertEqual(pack.text("tease-md"), "")
+        self.assertIn("tease-md", pack.missing())
+
+
+class TestAnImageInEitherFormat(unittest.TestCase):
+    """图片类的条目认后缀：写着的先试，`.png` / `.jpg` / `.jpeg` / `.webp` 都算。
+
+    背景素材是官方给的 PNG，而条目里写着 `.jpg`（roster 里那条老路径就是 jpg）。要是
+    解析器只认写着的后缀，一份 PNG 就会被判成「没有背景」——文件明明在那儿。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def touch(self, name: str) -> Path:
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        return path
+
+    def test_a_png_answers_for_a_jpg_entry(self):
+        path = self.touch("backgrounds/x.png")
+        pack = packs.Pack(self.root, "x")
+        self.assertEqual(pack.path("background"), path)
+
+    def test_the_declared_suffix_still_wins(self):
+        jpg = self.touch("backgrounds/x.jpg")
+        self.touch("backgrounds/x.png")
+        self.assertEqual(packs.Pack(self.root, "x").path("background"), jpg)
+
+    def test_the_pack_comes_before_the_flat_name(self):
+        inside = self.touch("packs/x/assets/background.png")
+        self.touch("backgrounds/x.jpg")
+        self.assertEqual(packs.Pack(self.root, "x").path("background"), inside)
+
+    def test_a_text_entry_does_not_grow_suffixes(self):
+        """只有图片这么放宽：`persona.md` 不会因为有个 `persona.png` 就被认走。"""
+        self.touch("packs/x/persona.png")
+        self.assertIsNone(packs.Pack(self.root, "x").path("persona"))
+
+
+class TestTheSpecialSettings(unittest.TestCase):
+    """「夹子」和「档位声线」是某一种人设才有的东西，三份文件互不牵连。
+
+    没有哪一份就等于没有那件事：规则不生效、提示词里不出现那一段，也不报错。
+    不能因为某位角色写了夹子，就给别的角色配上一套通用写法。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.pack = packs.Pack(self.root, "someone")
+
+    def test_a_character_without_them_is_simply_without(self):
+        self.assertFalse(packs.tease_rule(self.pack).on)
+        self.assertEqual(packs.tier_lines(self.pack), {})
+        self.assertEqual(self.pack.text("tease-md"), "")
+
+    def test_the_rule_and_the_voice_are_written_separately(self):
+        write(
+            self.root,
+            "packs/someone/voice/tease.toml",
+            '[tease]\nmarks = ["♡"]\nwindow = 4\nhint = "这一句可以夹"\n',
+        )
+        self.assertTrue(packs.tease_rule(self.pack).on)
+        self.assertEqual(packs.tier_lines(self.pack), {}, "写夹子不会连带出档位声线")
+
+        write(
+            self.root,
+            "packs/someone/voice/tiers.toml",
+            '[tiers]\ntrust = "信任：{name}"\n',
+        )
+        self.assertEqual(packs.tier_lines(self.pack), {"trust": "信任：{name}"})
+        self.assertEqual(packs.tease_rule(self.pack).window, 4, "写声线不会改掉夹子的额度")
+
+    def test_the_wording_is_its_own_file_too(self):
+        """`tease.md` 是人设段落，`tease.toml` 是计数规则：可以只写其中一份。"""
+        write(self.root, "packs/someone/voice/tease.md", "【夹子】偶尔夹一句。\n")
+        self.assertIn("偶尔夹一句", self.pack.text("tease-md"))
+        self.assertFalse(packs.tease_rule(self.pack).on, "只有话术没有规则，计数不启动")

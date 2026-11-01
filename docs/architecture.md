@@ -1996,6 +1996,7 @@ def test_an_empty_collection_still_falls_back_to_the_pack(self):
 | `tools/fake_napcat.py` | 假 NapCat：自动 @ 她，打印回包段类型。**改通道后的第一道回归** |
 | `tools/pack_channel.py` | 把 `channels/` 打成一个可独立交付的插件包（含禁用词检查） |
 | `tools/check_classes.py` | 查前端用到的 Tailwind 类在 CSS 产物里真的存在（防静默失效） |
+| `tools/crosscheck.py` | 交叉校验：作息表 ↔ 独立实现、祝日 ↔ 内阁府 CSV、共享事实 ↔ 各角色视角、北京日界 ↔ 东京作息、记忆分区、判官措辞、角色包解析。**单测问「按我以为的做吗」，它问「两处各自对的东西放到一起还对吗」**；`--offline` 跳过联网那一节 |
 | `demo.py` | 命令行里跑一轮，不启服务 |
 
 ### A.3 改代码后最小验证流程

@@ -18,6 +18,7 @@ from core.messages import Conversation, Message
 from core.plugin import TurnContext
 from core.protocol import Segment
 from core.store import Store
+from plugins import packs
 from plugins.affinity import Affinity
 from plugins.characters import Characters
 from plugins.gifts import GiftCatalogError, Gifts
@@ -140,6 +141,31 @@ class TestAStrangerStartsBelowTrust(Base):
         standing = later.read("u1", "fuyuko", surface="group")
         self.assertEqual(standing.value, 20, "回升到起点就停，不是 50")
         self.assertEqual(standing.tier, "distant")
+
+    def test_a_group_can_add_ten_a_day_and_no_more(self):
+        """群里没有礼物，对话是唯一能加分的东西——所以房间的上限比私聊宽一倍，但不是没有。
+
+        不封顶的后果实测过：一个晚上 +0.5/+1 一轮，能把一个人从「疏远」推到「亲近」，
+        那个数字就不再是任何人为他挣来的。
+        """
+        for _ in range(10):
+            self.affinity.change("u1", "fuyuko", 2, surface="group")
+        self.assertEqual(
+            self.affinity.read("u1", "fuyuko", surface="group").value, 30,
+            "20 起点 + 10；不是把一整晚都算进去",
+        )
+
+    def test_tomorrow_the_room_gets_its_ten_again(self):
+        for _ in range(10):
+            self.affinity.change("u1", "fuyuko", 2, surface="group")
+        later = Affinity(
+            self.store, start=20, clock=lambda: NOW + timedelta(days=1), labels=lambda c: "真乃"
+        )
+        later.change("u1", "fuyuko", 2, surface="group")
+        self.assertEqual(
+            later.read("u1", "fuyuko", surface="group").value, 32,
+            "第二天重新记：不是一次性额度",
+        )
 
     def test_the_rooms_with_gifts_keep_the_limit(self):
         for surface, floor in (("dm", 50), ("", 50)):
@@ -1031,3 +1057,84 @@ class TestOwnKeys(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheRosterByWork(Base):
+    """角色跟着作品分组，作品之间**平级**——谁也不给谁当「主作品」。
+
+    `characters/works/<id>.toml` 是作品的家；`work.toml` 只是「整台部署只有一个作品」时的
+    简写。没写 `work` 的角色：只有一个作品时归它（没别的可能）；有多个作品时单列一组
+    「未指定」，不塞进某一个作品里。
+    """
+
+    def roster(self, entries: str, *, works: dict[str, str] | None = None) -> Characters:
+        characters = self.root / "by-work"
+        (characters / "works").mkdir(parents=True)
+        for name, body in (works or {"one": '[work]\ntitle = "作品一"\n'}).items():
+            (characters / "works" / f"{name}.toml").write_text(body, encoding="utf-8")
+        (characters / "characters.toml").write_text(entries, encoding="utf-8")
+        return Characters(characters)
+
+    def test_a_character_without_work_belongs_to_the_only_work(self):
+        roster = self.roster('[[characters]]\nid = "a"\nname = "甲"\n')
+        self.assertEqual(roster.character("a").work, "one")
+        groups = roster.work_groups()
+        self.assertEqual([group["id"] for group in groups], ["one"])
+        self.assertEqual([one["id"] for one in groups[0]["characters"]], ["a"])
+        self.assertEqual(groups[0]["source"], "works/one.toml")
+
+    def test_two_works_are_side_by_side_not_parent_and_child(self):
+        roster = self.roster(
+            '[[characters]]\nid = "a"\nname = "甲"\nwork = "one"\n'
+            '\n[[characters]]\nid = "b"\nname = "乙"\nwork = "two"\n',
+            works={"one": '[work]\ntitle = "作品一"\n', "two": '[work]\ntitle = "作品二"\n'},
+        )
+        groups = roster.work_groups()
+        self.assertEqual([group["id"] for group in groups], ["one", "two"])
+        self.assertEqual([group["title"] for group in groups], ["作品一", "作品二"])
+        self.assertEqual([one["id"] for one in groups[1]["characters"]], ["b"])
+
+    def test_silence_is_visible_when_there_are_several_works(self):
+        """多个作品时没写 work：不能默认归第一个，那等于又造了一个主作品。"""
+        roster = self.roster(
+            '[[characters]]\nid = "a"\nname = "甲"\nwork = "one"\n'
+            '\n[[characters]]\nid = "b"\nname = "乙"\n',
+            works={"one": '[work]\ntitle = "作品一"\n', "two": '[work]\ntitle = "作品二"\n'},
+        )
+        self.assertEqual(roster.character("b").work, "")
+        groups = roster.work_groups()
+        self.assertEqual([group["id"] for group in groups], ["one", ""])
+        self.assertEqual([one["id"] for one in groups[1]["characters"]], ["b"])
+
+    def test_an_unknown_work_is_shown_rather_than_swallowed(self):
+        roster = self.roster('[[characters]]\nid = "a"\nname = "甲"\nwork = "typo"\n')
+        groups = roster.work_groups()
+        self.assertEqual([group["id"] for group in groups], ["typo"])
+        self.assertEqual(groups[0]["characters"][0]["id"], "a")
+        self.assertEqual(groups[0]["title"], "")
+
+    def test_the_single_work_shorthand_is_the_old_work_toml(self):
+        characters = self.root / "short"
+        characters.mkdir()
+        (characters / "work.toml").write_text(
+            '[work]\ntitle = "作品一"\n', encoding="utf-8"
+        )
+        (characters / "characters.toml").write_text(
+            '[[characters]]\nid = "a"\nname = "甲"\n', encoding="utf-8"
+        )
+        roster = Characters(characters)
+        self.assertEqual(roster.character("a").work, packs.DEFAULT_WORK)
+        group = roster.work_groups()[0]
+        self.assertEqual(group["source"], "work.toml")
+        self.assertEqual(group["title"], "作品一")
+
+    def test_more_than_one_work_means_no_deployment_wide_work(self):
+        """判官开场/记忆抽取那种「不针对某一位」的措辞，多作品时不点名任何作品。"""
+        roster = self.roster(
+            '[[characters]]\nid = "a"\nname = "甲"\nwork = "one"\n'
+            '\n[[characters]]\nid = "b"\nname = "乙"\nwork = "two"\n',
+            works={"one": '[work]\ntitle = "作品一"\n', "two": '[work]\ntitle = "作品二"\n'},
+        )
+        self.assertFalse(roster.work.named, "两个作品时没有「部署的作品」这回事")
+        self.assertEqual(roster.work_of("a").title, "作品一")
+        self.assertEqual(roster.work_of("b").title, "作品二")

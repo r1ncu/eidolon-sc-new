@@ -8,7 +8,14 @@ from pathlib import Path
 from core.messages import Conversation
 from core.plugin import TurnContext
 from core.store import Store
-from plugins.recall import EmbeddingError, OpenAIEmbeddings, Recall, read_passages
+from plugins.recall import (
+    EmbeddingError,
+    OpenAIEmbeddings,
+    Recall,
+    _stamp,
+    read_facts,
+    read_passages,
+)
 
 NOW = datetime(2026, 10, 23, 4, 0, tzinfo=timezone.utc)
 
@@ -369,3 +376,33 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestWhereTheFactsLive(unittest.TestCase):
+    """资料先看角色包：`packs/<id>/facts.md` 赢过老的 `facts/<id>.md`。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_the_pack_wins_over_the_flat_file(self):
+        (self.root / "facts").mkdir()
+        (self.root / "facts" / "x.md").write_text("旧的", encoding="utf-8")
+        (self.root / "packs" / "x").mkdir(parents=True)
+        (self.root / "packs" / "x" / "facts.md").write_text("包里的", encoding="utf-8")
+        self.assertEqual(read_facts(self.root, "x"), "包里的")
+
+    def test_only_the_flat_file_still_works(self):
+        (self.root / "facts").mkdir()
+        (self.root / "facts" / "x.md").write_text("旧的", encoding="utf-8")
+        self.assertEqual(read_facts(self.root, "x"), "旧的")
+
+    def test_nothing_anywhere_is_empty_not_an_error(self):
+        self.assertEqual(read_facts(self.root, "x"), "")
+
+    def test_the_stamp_follows_the_file_that_answers(self):
+        (self.root / "packs" / "x").mkdir(parents=True)
+        pack_file = self.root / "packs" / "x" / "facts.md"
+        pack_file.write_text("包里的", encoding="utf-8")
+        self.assertAlmostEqual(_stamp(self.root, "x"), pack_file.stat().st_mtime, places=3)

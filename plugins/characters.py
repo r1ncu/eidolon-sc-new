@@ -71,9 +71,16 @@ class Character:
     """The sheet's text, not its path: read once at startup, as upstream does."""
     avatar: Path | None = None
     scsp_avatar: Path | None = None
+    background: Path | None = None
+    """对话页的壁纸（SCSP 那张）；没有就是没有，页面自己退成印象色。"""
     voice_id: str = ""
     name_kana: str = ""
     name_romaji: str = ""
+    work: str = ""
+    """Which work she is from（`characters/works/<id>.toml` 或 `work.toml` 的 id）。
+
+    空字符串是「没人写」：这种角色归到部署自己的那个作品名下，所以单作品的部署永远
+    只有一组。写错了 id 也不会把角色弄丢——页面会单开一组，标题就是那个 id。"""
     unit: str | None = None
     """Her unit's name; None where the table above does not place her."""
     unit_reading: str | None = None
@@ -115,9 +122,11 @@ class Character:
             "color": self.color,
             "avatar": bool(self.avatar),
             "scsp_avatar": bool(self.scsp_avatar),
+            "background": bool(self.background),
             "unit": self.unit,
             "unit_reading": self.unit_reading,
             "unit_order": self.unit_order,
+            "work": self.work,
         }
 
 
@@ -128,7 +137,18 @@ class Characters(Plugin):
         self._root = Path(directory)
         self._config = self._root / config
         self._units = _read_units(self._root)
-        self._all: tuple[Character, ...] = _load(self._root, self._config, self._units)
+        # 先读作品，再读角色：角色表里的 `work` 是相对它说的。
+        # 作品是平级的：`characters/works/<id>.toml`，谁都不比谁「主」。
+        self._works = pack_file.load_works(self._root)
+        self._sole_work = (
+            next(iter(self._works.values())) if len(self._works) == 1 else None
+        )
+        # 只有「整台部署只有一个作品」时，没写 work 的人才有唯一答案；有多个作品时留空，
+        # 页面单列一组「未指定」——不能默认塞进某一个作品，那等于又造了一个主作品。
+        default_work = self._sole_work.id if self._sole_work is not None else ""
+        self._all: tuple[Character, ...] = _load(
+            self._root, self._config, self._units, default_work
+        )
         if not self._all:
             raise RuntimeError(
                 f"{self._root} 里没有角色。先建一个角色表：\n"
@@ -138,13 +158,35 @@ class Characters(Plugin):
         self._by_id = {character.id: character for character in self._all}
         self._paths = _sheet_paths(self._root, self._config)
         self._stamp = self._signature()
-        # 两条线：作品（共享，一份）与角色包（每人一份）。包只是路径，读不读由用的人决定。
-        self.work = pack_file.load_work(self._root)
+        # 两条线：作品（共享）与角色包（每人一份）。包只是路径，读不读由用的人决定。
+        # 包读哪一份作品，看角色表里她写的是哪一个——不是所有角色都演同一个作品。
         self._packs = {
-            character.id: pack_file.Pack(self._root, character.id, self.work)
+            character.id: pack_file.Pack(self._root, character.id, self._work_of(character))
             for character in self._all
         }
         self._adopt_packs()
+
+    @property
+    def work(self) -> pack_file.Work:
+        """给「不针对某一位角色」的提示词用的作品（判官开场、记忆抽取）。
+
+        整台部署只有一个作品时，它就是那一个；有多个作品时返回一个空的 `Work`——
+        这时候没有「部署的作品」这回事，让措辞退回中性，比随便挑一个当代表更诚实。
+        针对具体角色的地方一律走 `work_of(character_id)`。"""
+        return self._sole_work or pack_file.Work()
+
+    def _work_of(self, character: Character) -> pack_file.Work:
+        found = self._works.get(character.work)
+        if found is not None:
+            return found
+        # 写错了 id（或者根本没写、又有多个作品）：按她写的那个 id 建一个空作品，
+        # 页面就会单独显示一组、标题就是那个 id——写错要看得见。
+        return pack_file.Work(id=character.work)
+
+    def work_of(self, character_id: str) -> pack_file.Work:
+        """Her work, by id. Unknown ids get an empty work rather than somebody else's."""
+        character = self._by_id.get(character_id)
+        return self._work_of(character) if character is not None else pack_file.Work()
 
     def _adopt_packs(self) -> None:
         """A `packs/<id>/persona.md` wins over `sheets/<id>.md`, and nothing else changes.
@@ -155,7 +197,12 @@ class Characters(Plugin):
         from dataclasses import replace
 
         adopted = tuple(
-            replace(character, sheet=self._packs[character.id].text("persona") or character.sheet)
+            replace(
+                character,
+                sheet=self._packs[character.id].text("persona") or character.sheet,
+                # 壁纸也先看角色包：`packs/<id>/assets/background.*` 赢过表里的路径。
+                background=self._packs[character.id].path("background") or character.background,
+            )
             for character in self._all
         )
         self._all = adopted
@@ -175,25 +222,34 @@ class Characters(Plugin):
         refused, and the previous roster stays in place until the file is valid again.
         """
         try:
-            found = _load(self._root, self._config)
+            works = pack_file.load_works(self._root)
+            sole = next(iter(works.values())) if len(works) == 1 else None
+            default = sole.id if sole is not None else ""
+            found = _load(self._root, self._config, self._units, default)
         except Exception:
             return False
         if not found:
             return False
+        self._works = works
+        self._sole_work = sole
         self._all = found
         self._by_id = {character.id: character for character in found}
         self._paths = _sheet_paths(self._root, self._config)
         self._stamp = self._signature()
-        self.work = pack_file.load_work(self._root)
         self._packs = {
-            character.id: pack_file.Pack(self._root, character.id, self.work)
+            character.id: pack_file.Pack(self._root, character.id, self._work_of(character))
             for character in found
         }
         return True
 
     def _signature(self) -> tuple:
         out: list[tuple[str, int, int]] = []
-        for path in (self._config, self._root / UNITS_FILE, *self._paths.values()):
+        # 作品文件也算进来：加一个 `works/<id>.toml`、或者给角色填了 `work`，不用重启。
+        work_files = [self._root / pack_file.WORK_FILE]
+        folder = self._root / pack_file.WORKS_DIR
+        if folder.is_dir():
+            work_files.extend(sorted(folder.glob("*.toml")))
+        for path in (self._config, self._root / UNITS_FILE, *self._paths.values(), *work_files):
             try:
                 info = path.stat()
                 out.append((str(path), info.st_mtime_ns, info.st_size))
@@ -225,6 +281,11 @@ class Characters(Plugin):
             return character.scsp_avatar or character.avatar
         return character.avatar
 
+    def background(self, character_id: str) -> Path | None:
+        """The chat page's wallpaper, or None — the page then keeps her tint."""
+        character = self._by_id.get(character_id)
+        return character.background if character else None
+
     def name_of(self, character_id: str) -> str | None:
         """Her display name, or None for an identifier this deployment does not know —
         what a memory told to a character no longer here is labelled with."""
@@ -253,6 +314,31 @@ class Characters(Plugin):
         from. The page shows the second half in the character sheet — 「这份人设读的是哪个
         文件、还有什么是旧的」 is the first question when a character sounds off."""
         return {**character.brief(), "pack": self.pack(character.id).compact()}
+
+    def work_groups(self) -> tuple[dict[str, object], ...]:
+        """作品 → 它的角色，按角色表里第一次出现的顺序。
+
+        作品是平级的：页面照这个分组画，一个作品一组，谁也不排在「主」的位置上。
+        角色写了不存在的 id 也单开一组、标题就是那个 id；多个作品时没写 work 的人
+        落在 `id` 为空的那一组，页面显示成「未指定作品」——写漏了要看得见。"""
+        groups: dict[str, list[Character]] = {}
+        for character in self._all:
+            groups.setdefault(character.work, []).append(character)
+        out: list[dict[str, object]] = []
+        for work_id, members in groups.items():
+            work = self._works.get(work_id) or pack_file.Work(id=work_id)
+            out.append(
+                {
+                    **work.as_dict(),
+                    # 分组的键就是页面用的 id：没写 work 时是空串，写错了就是那个 id。
+                    "id": work_id,
+                    "characters": [
+                        {"id": one.id, "name": one.name, "pack": self.pack(one.id).compact()}
+                        for one in members
+                    ],
+                }
+            )
+        return tuple(out)
 
     def capabilities(self) -> dict[str, object]:
         return {
@@ -294,22 +380,24 @@ def _load(
     root: Path,
     config: Path,
     units: tuple[tuple[str, str, tuple[str, ...]], ...] = (),
+    work_id: str = "",
 ) -> tuple[Character, ...]:
     if config.exists():
         with config.open("rb") as file:
             data = tomllib.load(file)
         return tuple(
-            _from_entry(root, entry, units)
+            _from_entry(root, entry, units, work_id)
             for entry in data.get("characters", ())
             if str(entry.get("id") or "").strip()
         )
-    return _from_sheets(root)
+    return _from_sheets(root, work_id)
 
 
 def _from_entry(
     root: Path,
     entry: dict,
     units: tuple[tuple[str, str, tuple[str, ...]], ...] = (),
+    work_id: str = "",
 ) -> Character:
     """One `[[characters]]` block. Paths in the file are relative to the file, and a
     missing avatar or sheet is a fact rather than an error: a character without a picture
@@ -322,6 +410,7 @@ def _from_entry(
         sheet = f"# 人设：{entry.get('name', entry['id'])}\n\n（这个人设还没有写。）\n"
     avatar = _path(root, entry.get("avatar"))
     scsp = _path(root, entry.get("scsp_avatar"))
+    wallpaper = _path(root, entry.get("background"))
     character_id = str(entry["id"])
     unit, reading, order = _unit_of(character_id, units)
     return Character(
@@ -335,7 +424,9 @@ def _from_entry(
         sheet=sheet,
         avatar=avatar if avatar and avatar.exists() else None,
         scsp_avatar=scsp if scsp and scsp.exists() else None,
+        background=wallpaper if wallpaper and wallpaper.exists() else None,
         voice_id=str(entry.get("voice_id") or ""),
+        work=str(entry.get("work") or "").strip() or work_id,
         unit=unit,
         unit_reading=reading,
         unit_order=order,
@@ -434,7 +525,7 @@ A directory that ships with a `README.md` used to wake up with a character calle
 a bare deployment looked like it had somebody in it, and the 「no characters」 error — the one
 that tells you to copy the example — never fired."""
 
-def _from_sheets(root: Path) -> tuple[Character, ...]:
+def _from_sheets(root: Path, work_id: str = "") -> tuple[Character, ...]:
     """No `characters.toml`: every `*.md` is a character, named by its heading. This is
     what a bare directory — a test, a demo, a half-copied deployment — still gives you."""
     files = [
@@ -450,6 +541,7 @@ def _from_sheets(root: Path) -> tuple[Character, ...]:
             intro="",
             color=FALLBACK_COLOR,
             sheet=_text(file),
+            work=work_id,
         )
         for file in files
         if _text(file).strip()

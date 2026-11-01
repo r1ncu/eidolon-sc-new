@@ -26,6 +26,9 @@ services:
       SCCORE_DB: /data/scbot.db
       SCCORE_MEDIA: /data/media
       QQ_ONEBOT_WS: ws://napcat:3001
+      # 原版网页（Next.js，见 `web_compat.py`）要的那套接口。只在 compose 网络里，
+      # 不发布到宿主机：它是给前端容器用的。不想要就删掉这一行，端口就不会开。
+      SCCORE_COMPAT_PORT: "8101"
     volumes:
       - scbot-data:/data
       # 人设与规则是数据，不是代码：挂在外面才改得动。改完下一轮就生效（见 DEPLOY.md），

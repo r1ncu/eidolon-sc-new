@@ -114,7 +114,7 @@ class World:
         那一条她自己对世界的看法；没有它，行为和以前一模一样（只有事实）。"""
         self._settle = settle
         self._words = tuple(getattr(work, "meta_words", ()) or META_WORDS)
-        """作品话题词：优先 `work.toml`，没有就用这份默认表。"""
+        """作品话题词：优先她那一个作品的 `works/<id>.toml`，没有就用这份默认表。"""
         self._office = Live(self._world / "office.md", settle=settle, log=self._log)
         self._meta = Live(self._world / "meta.md", settle=settle, log=self._log) if meta else None
         self._world_fact = Live(self._world / "work.md", settle=settle, log=self._log)

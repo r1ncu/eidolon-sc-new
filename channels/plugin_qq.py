@@ -327,7 +327,7 @@ class QQService(Plugin):
             }
 
         async def space_status(query, body):  # noqa: ANN001 - plugin.Route
-            return self.qzone.status() | {"enabled": self.config.qzone}
+            return self.qzone.status() | {"enabled": self.channel.config.qzone}
 
         async def space_post(query, body):  # noqa: ANN001 - plugin.Route
             return await self.speak_out(body or {})
@@ -1076,6 +1076,12 @@ class QQService(Plugin):
             try:
                 if not getattr(self.client, "connected", False):
                     await asyncio.sleep(WAIT_CONNECT)
+                    continue
+                # 设置页那个「发 QQ 空间」的开关。问的是**通道的** config（网页拨过的开关铺在
+                # 上面），不是插件自己那份启动时读的——`chance` 是构造时定死的，改不了，所以在
+                # 这条调度上加一道门：关掉就是今天不发，打开就按原来的概率来。
+                if not self.channel.config.qzone:
+                    await asyncio.sleep(QZONE_TICK)
                     continue
                 await self.qzone.maybe()
             except Exception as exc:  # 一条说说发不出去，不该把整条通道带走

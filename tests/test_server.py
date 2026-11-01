@@ -181,3 +181,144 @@ class TestServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheChatWallpaper(unittest.TestCase):
+    """`background` 这个字段以前是死的：表里写着、代码不读、`backgrounds/` 从没建过。
+
+    现在是「设置 → 外观 → SCSP 聊天背景」那张图：按角色取，和头像同一条路。
+    """
+
+    def build(self, *, with_file: bool) -> "TestTheChatWallpaper":
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / "characters").mkdir()
+        (root / "characters" / "test.md").write_text(SHEET, encoding="utf-8")
+        (root / "characters" / "characters.toml").write_text(
+            '[[characters]]\nid = "test"\nname = "测试角色"\n'
+            'background = "backgrounds/test.jpg"\n',
+            encoding="utf-8",
+        )
+        if with_file:
+            (root / "characters" / "backgrounds").mkdir()
+            (root / "characters" / "backgrounds" / "test.jpg").write_bytes(b"jpeg-bytes")
+        settings = Settings(
+            base_url="http://unused",
+            api_key="unused",
+            model="fake",
+            db=str(root / "kernel.db"),
+            characters=str(root / "characters"),
+            turns_per_hour=0,
+        )
+        self.app = App(settings, ScriptedLLM(REPLY, size=4))
+        self.addCleanup(self.app.close)
+        return self
+
+    def test_the_state_points_the_page_at_it(self):
+        self.build(with_file=True)
+        state = self.app.state()
+        self.assertEqual(state["character"]["background_url"], "/media/background/test")
+        self.assertTrue(state["characters"][0]["background"])
+
+    def test_the_list_entry_carries_the_urls_too(self):
+        """对话页是从**列表项**里取出这一位来画的（`contentArea()`），所以列表项也得有 url。
+
+        少了这几个键，对话框里没有头像、壁纸也铺不上——而 `character` 那个单数对象一直是好的，
+        于是只补它看起来「测试都过」，页面却是空的。
+        """
+        self.build(with_file=True)
+        entry = self.app.state()["characters"][0]
+        self.assertIn("avatar_url", entry, "键要在，值可以是空（这个夹具没有头像）")
+        self.assertEqual(entry["background_url"], "/media/background/test")
+
+
+    def test_a_character_without_one_says_so(self):
+        self.build(with_file=False)
+        state = self.app.state()
+        self.assertEqual(state["character"]["background_url"], "")
+        self.assertFalse(state["characters"][0]["background"])
+
+    def test_the_file_is_served_over_its_own_route(self):
+        self.build(with_file=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.app, b"<html></html>"))
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/media/background/test"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+            self.assertEqual(response.read(), b"jpeg-bytes")
+
+    def test_no_file_means_404_not_a_crash(self):
+        self.build(with_file=False)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.app, b"<html></html>"))
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/media/background/test"
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(url, timeout=10)
+        self.assertEqual(caught.exception.code, 404)
+
+
+class TestThePageCanLiveSomewhereElse(unittest.TestCase):
+    """两份前端合成一份以后，旧地址只当门房：把人和他正在看的那一页原样送过去。
+
+    配 `SCCORE_WEB_REDIRECT` 才有这一层；不配就还是老样子，自己画——一个 checkout 不该
+    因为别人合并了前端就打不开自己的页面。
+    """
+
+    def setUp(self) -> None:
+        import os
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / "characters").mkdir()
+        (root / "characters" / "test.md").write_text(SHEET, encoding="utf-8")
+        settings = Settings(
+            base_url="http://unused", api_key="unused", model="fake",
+            db=str(root / "kernel.db"), characters=str(root / "characters"), turns_per_hour=0,
+        )
+        self.app = App(settings, ScriptedLLM(REPLY, size=4))
+        self.addCleanup(self.app.close)
+        self.redirect = mock.patch.dict(os.environ, {"SCCORE_WEB_REDIRECT": "http://web.example:3000"})
+        self.redirect.start()
+        self.addCleanup(self.redirect.stop)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.app, PAGE.encode()))
+        self.addCleanup(self.server.server_close)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+
+    def ask(self, path: str) -> tuple[int, str]:
+        import http.client
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        location = response.getheader("Location") or ""
+        response.read()
+        connection.close()
+        return response.status, location
+
+    def test_a_page_route_goes_to_the_one_frontend_with_its_path(self):
+        for path in ("/conversations", "/settings/world", "/conversation/fuyuko"):
+            status, location = self.ask(path)
+            self.assertEqual(status, 301, path)
+            self.assertEqual(location, f"http://web.example:3000{path}", path)
+
+    def test_the_api_still_answers_here(self):
+        """门房只转页面：接口还得在这边答，否则健康检查和脚本全断。"""
+        import http.client
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection.request("GET", "/api/roster")
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"roster", body)

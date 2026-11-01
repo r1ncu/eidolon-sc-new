@@ -158,7 +158,7 @@ class Memory(Plugin):
     ) -> None:
         self._store = store
         # 记忆抽取的提示里原本写死《偶像大师 闪耀色彩》283 事务所。这是「作品」的事，
-        # 不归任何一个角色：从 `work.toml` 来，没有就退成中性措辞。
+        # 不归任何一个角色：从作品表来，没有就退成中性措辞。
         name = getattr(work, "name", None)
         house = getattr(work, "house", None)
         title = name() if callable(name) else ""

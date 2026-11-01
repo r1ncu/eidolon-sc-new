@@ -51,6 +51,7 @@ from core.live import source
 from core.prompt import Section, Slot
 from plugins.affinity import BELOW_TRUST
 from plugins.affinity import label as tier_label
+from plugins.packs import tier_lines
 
 from .stage import load as load_stage
 from .stage import word as stage_word
@@ -190,6 +191,8 @@ class Presence:
         settle: float = 0.35,
         log: Any | None = None,
         owner_stage: str = OWNER_FLOOR,
+        pack: Any | None = None,
+        extra: str | Path | None = None,
     ) -> None:
         """`template` is the group register, `direct` the private one. Either may be a path
         or the text itself.
@@ -202,10 +205,18 @@ class Presence:
         `addressee.*`, `distance.*`, and the two fallbacks. A path, a dict, or nothing —
         nothing means the neutral lines, which is what a checkout with no character data
         should say.
+
+        `pack` is her folder (`plugins/packs.py`). It is what decides the voice a room
+        hears at each distance (`packs/<id>/voice/tiers.toml`) — that is character data,
+        not a rule of this channel, and a character without the file simply has no line.
         """
         self._group = source(template, settle=settle, log=log)
         self._direct = source(direct, settle=settle, log=log)
         self._stage = load_stage(stage)
+        self._pack = pack
+        # 语域文件之外再挂的一段（她自己的某个玩法写成的独立文件）。写在语域里也行，
+        # 但那样就不能单独换掉它；`{{extra}}` 是它落地的位置。
+        self._extra = source(extra, settle=settle, log=log)
         # Which rung the producer starts on. 空字符串 means 「 treat him like anyone else」,
         # which is how you test the first-meeting voice on your own account.
         self._owner_stage = owner_stage
@@ -424,49 +435,36 @@ class Presence:
             .replace("{{time}}", clock)
             .strip()
         )
+        aside = self._extra.text().strip() if self._extra is not None else ""
+        if "{{extra}}" in text:
+            text = text.replace("{{extra}}", aside)
+        elif aside:
+            text += "\n\n" + aside
         text = re.sub(r"\n{3,}", "\n\n", text)
         if not bracket:
             text += "\n【本条】不要在括号里补心里话，全部放在营业的语气里。"
         if scene == GROUP and tier:
-            text += "\n\n" + _voice(tier)
+            voice = _voice(tier, self._pack)
+            if voice:
+                text += "\n\n" + voice
         text += "\n\n" + _call(call)
         return [Section(Slot.TURN, text, title="qq:presence")]
 
 
-def _voice(tier: str) -> str:
-    """Which of her two voices the room gets, as one line in the prompt.
+def _voice(tier: str, pack: Any = None) -> str:
+    """Which voice the room gets at this distance — read from her own pack, never assumed.
 
-    「冬優（ふゆ）」is the one she puts on — the smile, the soft sentence endings, the ♡.
-    「冬優子」is who is underneath, and only people she is used to hear her. So this is not a
-    dial from 「polite」 to 「rude」: it is a person taking the mask off, and the mask is
-    sweetest for the people she knows least. The ♡ density is stated here because the
-    persona file's own rung is chosen by turn count, and a member with thirty turns but a
-    distance of twenty was getting neither the mask nor the bite.
+    The wording is character data (`packs/<id>/voice/tiers.toml`), because it is exactly
+    the thing that differs between people: one character has a performing self she puts on
+    for strangers and takes off for the ones she is used to, another has nothing of the
+    sort. A pack without that file gets no line at all — which is the honest answer, and
+    the only one that cannot put somebody else's trademark on her face.
+
+    `{name}` in the file is replaced with the band's own name（冷淡／疏远／信任…）.
     """
-    name = tier_label(tier)
-    if tier == "cold":
-        return (
-            f"【距离·语气】你现在收着（{name}）：敬语还在，但短、平、不甜——句尾放平，不拖长音，"
-            "♡ 和「ふゆ♡」都不挂。不主动递话、不打听他的事；不高兴就客气地说"
-            "（「……そういうところ、ちょっと苦手です」），不甩私下的短句。"
-        )
-    if tier in BELOW_TRUST:
-        return (
-            f"【距离·语气】你和他还不熟（{name}），这一档整场都是「冬優（ふゆ）」——人设里那个"
-            "笑眯眯、句尾软软的营业人格，比对着镜头还要甜一档：句子短、往上翘、会主动把话递过去。"
-            "**这个号只发中文**（日语那段不显示），所以♡要挂在中文里才有用：「ふゆ♡」"
-            "「好呀♡」「……是吗♡」这样，每三四条里至少一个——放在自我介绍、被夸、真的笑出来的时候。"
-            "**但连着两条不许都挂**：每条都带就是口癖，不是招牌；上一句已经挂过，这一句就干净地说。"
-            "不交心：问到私事就笑着绕开，不主动打听他的事。"
-            "「ハ？」「バーカ」和中文的「哈？」「笨蛋」一句都不该有——那是冬優子那边才有的。"
-            "这层甜是刻意摆出来的，不是真心。"
-        )
-    return (
-        f"【距离·语气】这个人你已经熟了（{name}）：冬優子出来了——私下的那几句可以出来，"
-        "偶尔一声「ハ？」「バーカ」，生气的时候（真的假的都算）也会用。"
-        "「ふゆ♡」和♡ 到这个距离不必再挂（十条里最多一次，当武器用）。"
-        "仍旧是一句，别把私下那一整套搬进群里。"
-    )
+    line = (tier_lines(pack) or {}).get(tier) or ""
+    return line.replace("{name}", tier_label(tier)) if line else ""
+
 
 
 def _call(can: bool) -> str:

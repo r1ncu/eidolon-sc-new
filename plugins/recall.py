@@ -355,7 +355,11 @@ def read_facts(root: Path, character_id: str) -> str:
     what `off` costs, and why it is the default."""
     if not character_id:
         return ""
-    for path in (root / "facts" / f"{character_id}.md", root / f"{character_id}.facts.md"):
+    for path in (
+        root / "packs" / character_id / "facts.md",
+        root / "facts" / f"{character_id}.md",
+        root / f"{character_id}.facts.md",
+    ):
         try:
             if path.is_file():
                 return path.read_text(encoding="utf-8")
@@ -417,7 +421,11 @@ def _pieces(body: str, limit: int) -> list[str]:
 def _stamp(root: Path, character_id: str) -> float:
     """When the facts file last changed, so an edit is picked up on the next turn without
     a restart and without re-embedding the passages that did not change."""
-    for path in (root / "facts" / f"{character_id}.md", root / f"{character_id}.facts.md"):
+    for path in (
+        root / "packs" / character_id / "facts.md",
+        root / "facts" / f"{character_id}.md",
+        root / f"{character_id}.facts.md",
+    ):
         try:
             return path.stat().st_mtime
         except OSError:

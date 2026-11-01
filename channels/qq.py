@@ -60,6 +60,7 @@ from core.events import SegmentComplete, SegmentDelta, TurnDone, TurnFailed, Tur
 from core.llm import ChatMessage
 from core.prompt import Section, Slot
 from core.protocol.reply import PhotoTagged, unquote
+from plugins import tease as tease_file
 from plugins.affinity import label as tier_label, tier_of
 
 from . import calendar as calendar_file
@@ -77,6 +78,26 @@ from .world import World
 MAX_PHOTOS = 2
 MAX_PHOTO_BYTES = 6 * 1024 * 1024
 _CQ = re.compile(r"\[CQ:[^\]]*\]")
+
+SWITCHES: tuple[tuple[str, str], ...] = (
+    ("enabled", "enabled"),
+    ("private", "private"),
+    ("called", "called"),
+    ("ambient", "ambient"),
+    ("stickers", "stickers"),
+    ("digest", "digest"),
+    ("qzone", "qzone"),
+    ("image", "image"),
+)
+"""网页「设置 → 插件 → QQ 聊天插件」里那几个开关，和它们各自改 `QQConfig` 的哪个字段。
+
+一张表，两边读：通道按它把开关铺到配置上，网页按它列出要画哪几行。名字是给网页当 id 用的，
+人话写在文案表里（那是界面的事，不是通道的事）。
+
+为什么不改 `.env` 而是在库里另存一层：`.env` 是启动时读一次的，改一次要重启一次；「今天想不想
+在群里说话」不该是一次重启的事。库里存的是**覆盖**，没存过的仍然按 `.env` 来——部署者写的那份
+配置始终是默认值，网页只改它动过的那几项。
+"""
 _DM = "dm"
 THREAD_DM = "qq:dm"
 
@@ -185,6 +206,11 @@ LOVE_NUDGE = "（忽然想他了。没有人在跟你说话，是你自己拿起
 Same lesson as `OWN_NUDGE`: a model handed a line as its user message answers it. There is
 no line here — nobody said anything — so the turn is a stage direction and the reply is
 whatever she decided to send."""
+
+TEASE_NOTE = """【夹子·计数】{body}"""
+"""把「十条最多一次」从自律变成一句事实：她数不了自己前十句（历史里只有二十轮、还不带统计），
+所以由通道数，然后把结果告诉她。数字比形容词管用——「十条里最多一次」她听过就当看过，
+「你最近十条里有两条挂了♡」她才会改。"""
 
 LANG_NOTE = """【这个号只看中文】QQ 里对方能看到的**只有 `<zh>`**：`<ja>` 是给配音用的原文，一个字都不显示。
 所以每一段都必须写 `<zh>`，而且是完整的中文译文——**`<zh>` 空着就等于你这一段没说话**。
@@ -350,7 +376,8 @@ class QQChannel:
     ) -> None:
         self.app = app
         self.client = client
-        self.config = config
+        self._base_config = config
+        self._switch_memo: tuple[float, dict[str, bool]] = (0.0, {})
         # 生图的渲染器（`channels.draw`）。`None` = 没有这个功能，协议里的 `<photo>` 照样
         # 解析、照样存库，只是不会有人去画——和接画家之前一模一样。
         self.painter = painter
@@ -390,6 +417,11 @@ class QQChannel:
             own("qq"),
             direct=own("dm"),
             stage=self.stage,
+            # 「夹子」这类只属于某个人设的规则，单独一份文件；语域里的 {{extra}} 是它的位置。
+            extra=own("tease-md"),
+            # 群里那一档的声音是**她的数据**：`packs/<id>/voice/tiers.toml`。
+            # 没有这份文件的角色就没有这一行——不能把冬優子的营业人格借给别人。
+            pack=files,
         )
         self.outbox = outbox or box.Outbox(app.store, client.call, log=self.log)
         self.pack = stickers
@@ -408,6 +440,9 @@ class QQChannel:
             idols=own("relations"),
         )
         self._rng = rng or random.Random()
+        self._tease = tease_file.tease_rule(files)
+        """「夹」的规则，来自她自己的包。没有这份文件 = 这个角色没有这一回事，
+        计数与许可整体不生效（而不是退回一套通用默认值）。"""
         self._sleep_memo: dict[str, int] = {}
         """今晚掷到几，先记在这里再落库。库写不进去（表没建、盘满）时，至少这一夜还是同一个
         数：只有数据库那一份的话，一次写失败就等于每轮重掷，她会在 0:30 醒、0:40 又睡。"""
@@ -451,6 +486,11 @@ class QQChannel:
 
     async def on_event(self, event: dict[str, Any]) -> None:
         if event.get("post_type") != "message":
+            return
+        # 设置页的总开关：关掉就是「她现在不在 QQ 上说话」。读的是 `config`，而 `config` 会把
+        # 网页拨过的开关铺在 `.env` 上，所以拨完下一轮就生效，不用重启。事件照收——她还在线，
+        # 只是一句都不回。
+        if not self.config.enabled:
             return
         kind = event.get("message_type")
         if kind == "group":
@@ -891,6 +931,53 @@ class QQChannel:
             f"今晚熬 {hours} 小时，{when} 睡"
         )
         return hours
+
+    @property
+    def config(self) -> Any:
+        """The settings in force, with the switches set on the page laid over them.
+
+        网页上拨的那几个开关存在 `qq_flags` 里（`switch:<名字>`），没拨过的不写——所以部署者的
+        `.env` 始终是默认值，网页只覆盖它动过的那几项。
+
+        读一次缓存两秒：一轮对话里 `config` 会被读几十次，每条都查一次库等于给她的每一次呼吸
+        加一次 IO；两秒足够让开关在「下一轮」生效，而人在页面上拨完再切回对话页本来就要一会儿。
+        """
+        overrides = self._switch_overrides()
+        if not overrides:
+            return self._base_config
+        return replace(self._base_config, **overrides)
+
+    @config.setter
+    def config(self, value: Any) -> None:
+        """换掉基础那一层。测试按用例改配置、部署者热改都走这里；网页的开关照样铺在上面。"""
+        self._base_config = value
+        self._switch_memo = (0.0, {})
+
+    def _switch_overrides(self) -> dict[str, bool]:
+        now = datetime.now(timezone.utc).timestamp()
+        stamp, cached = self._switch_memo
+        if now - stamp < 2.0:
+            return cached
+        out: dict[str, bool] = {}
+        for name, field in SWITCHES:
+            raw = self._flag(f"switch:{name}")
+            if raw is not None:
+                out[field] = raw == "1"
+        self._switch_memo = (now, out)
+        return out
+
+    def switches(self) -> list[dict[str, object]]:
+        """What the settings page lists: each switch's name, and whether it is on now."""
+        current = self.config
+        return [{"id": name, "on": bool(getattr(current, field))} for name, field in SWITCHES]
+
+    def set_switch(self, name: str, on: bool) -> bool:
+        """Flip one switch and drop the cache, so the next message already obeys it."""
+        if name not in {one for one, _ in SWITCHES}:
+            return False
+        self._flag_set(f"switch:{name}", "1" if on else "0")
+        self._switch_memo = (0.0, {})
+        return True
 
     def _flag(self, key: str) -> str | None:
         try:
@@ -1489,6 +1576,10 @@ class QQChannel:
         ]
         # 每轮都加，连她自己的插话也算：这是这个号怎么说话，不是这一句要回什么。
         sections.append(Section(Slot.TURN, LANG_NOTE, order=5, title="qq:lang"))
+        if not private and tier:
+            tease = self._tease_note(room, tier)
+            if tease is not None:
+                sections.append(tease)
         if not ambient:
             # 她正在回的那个人身上有没有人写过一件事。旁听（ambient）时不算：那时候没有
             # 「和她说话的人」，把触发者的 note 摆进去只会让她以为是在跟这个人说话。
@@ -1789,6 +1880,7 @@ class QQChannel:
                 # 回复可能被切成好几条（`SegmentComplete`），群里看到的是每一条，她记得的
                 # 也应该是每一条。
                 self._remember_self(room, piece)
+                self._note_tease(room, piece)
                 self._last_spoke[room] = asyncio.get_running_loop().time()
         if sticker:
             # A segment that was nothing but `[贴纸]` is not an empty message: it is the
@@ -1797,6 +1889,58 @@ class QQChannel:
         if not piece:
             return first
         return False
+
+    # ---- 夹子的计数（`TEASE_WINDOW`）
+
+    def _tease_window(self, room: str) -> str:
+        """她自己在这个房间最近几条消息里「夹/没夹」，最旧的在左边。
+
+        记号、窗口长度、键名都由她那份规则决定（通道与判官插件读同一份文件），
+        各写一份迟早会对不上。
+        """
+        return tease_file.window_of(self._flag(tease_file.flag_key(room)), self._tease.window)
+
+    def _note_tease(self, room: str, piece: str) -> None:
+        """一条消息发出去之后记账。只认记号，不猜语气。"""
+        if not self._tease.on:
+            return
+        bit = "1" if tease_file.marks_in(piece, self._tease.marks) else "0"
+        self._flag_set(
+            tease_file.flag_key(room), (self._tease_window(room) + bit)[-self._tease.window:]
+        )
+
+    def _tease_note(self, room: str, tier: str) -> Section | None:
+        """Tell her how many of her last ten had `♡` — and what that means in this band.
+
+        只对信任以上（40+）说。更生疏的两档不需要：那里甜不甜由档位自己决定
+        （`presence._voice` 已经把「营业声线」和「收着的冷淡」分别交代过），再给一条计数
+        等于在两条规则里挑一条执行——而挑错的那一半会把常态当武器。
+
+        为什么在通道里数、而不是让模型数：历史里只留二十轮，还没有「哪句带了♡」这个字段，
+        所以「十条最多一次」对它来说是一条永远查不到的规则。数出来的数字是事实，规则是许愿。
+        """
+        window = self._tease_window(room)
+        used = window.count("1")
+        gap = len(window) - window.rfind("1") - 1 if "1" in window else None
+        if not self._tease.on:
+            # 这个角色没有「夹」这回事：既不计数，也不必提醒她。
+            return None
+        if tier in tease_file.TIERS:
+            if used == 0:
+                body = (
+                    f"你最近 {len(window) or self._tease.window} 条里没夹过；这一条有额度。"
+                    "值不值得夹，看这一句是不是在逗你——判官会直接告诉你。"
+                )
+            else:
+                body = (
+                    f"你最近 {len(window)} 条里有 {used} 条挂了♡，上一次是 {gap} 条之前。"
+                    "规则是十条最多一次——这几条先别夹，把话直接说。"
+                )
+        else:
+            # 疏远档本来就整场营业声线（`presence._voice`）：那层甜是常态，不是「夹」，
+            # 再加一条计数只会让她把常态也当成武器。
+            return None
+        return Section(Slot.TURN, TEASE_NOTE.format(body=body), order=6, title="qq:tease")
 
     def _sticker_row(self) -> dict[str, Any] | None:
         """Which sticker she would send.

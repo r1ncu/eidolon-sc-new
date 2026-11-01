@@ -206,6 +206,8 @@ const T = {
       phoneTextureOff: "电话质感关",
       scspAvatarsOn: "SCSP 头像开",
       scspAvatarsOff: "SCSP 头像关",
+      scspBackgroundsOn: "SCSP 聊天背景开",
+      scspBackgroundsOff: "SCSP 聊天背景关",
       ownKeysNone: "全部用部署者的服务",
       reachOutsOn: "开",
       reachOutsOff: "关",
@@ -237,7 +239,7 @@ const T = {
       unsaved: "尚未保存",
       saved: "已保存，所有设备共用这份档案",
     },
-    appearance: { scspAvatars: "SCSP 头像" },
+    appearance: { scspAvatars: "SCSP 头像", scspBackgrounds: "SCSP 聊天背景" },
     call: {
       mic: "默认麦克风",
       micHint: "语音通话默认使用的麦克风。通话中可以在通话层上切换，切换后的会成为新的默认。",
@@ -505,6 +507,8 @@ const state = {
   draft: "",
   sending: false,
   scsp: false,
+  scspBg: false,
+  /* SCSP 的聊天背景要不要铺在对话页上；和头像一样只存在这台设备。 */
   reachOuts: null,
   stats: null,
   statsRange: "all",
@@ -731,15 +735,21 @@ function appearanceKey() {
 function loadAppearance() {
   try {
     const stored = JSON.parse(localStorage.getItem(appearanceKey()) || "{}");
-    return stored && stored.scspAvatars === true;
+    return {
+      scspAvatars: stored && stored.scspAvatars === true,
+      scspBackgrounds: stored && stored.scspBackgrounds === true,
+    };
   } catch {
-    return false;
+    return { scspAvatars: false, scspBackgrounds: false };
   }
 }
 
 function keepAppearance() {
   try {
-    localStorage.setItem(appearanceKey(), JSON.stringify({ scspAvatars: state.scsp }));
+    localStorage.setItem(
+      appearanceKey(),
+      JSON.stringify({ scspAvatars: state.scsp, scspBackgrounds: state.scspBg })
+    );
   } catch {
     /* 存不下：这次只在页面里生效。 */
   }
@@ -1299,7 +1309,15 @@ function conversationView(character) {
   const phoneKey = callEnabled()
     ? `<button type="button" aria-label="${esc(T.chat.call(character.name))}" title="${T.chat.callTooltip}" class="group/button inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 hover:bg-muted hover:text-foreground" id="call-button">${icon("phone", "size-5 text-her-mark")}</button>`
     : "";
-  return `<div id="chat-frame" style="${herVars(character.color)}" class="relative flex h-full flex-col overflow-hidden bg-her-wall text-foreground">
+  // SCSP 聊天背景：铺在 frame 自己的 background 上，不加图层——加绝对定位的子层会盖住
+  // 气泡，或者要给它后面每一块都补 z-index。顶部压一层她的印象色，名字才看得清。
+  const wallpaper = state.scspBg && character.background_url ? character.background_url : "";
+  const paper = wallpaper
+    ? ";background-image:linear-gradient(to bottom,color-mix(in srgb,var(--her-wall) 82%,transparent) 0,color-mix(in srgb,var(--her-wall) 34%,transparent) 10%,transparent 30%),url('" +
+      wallpaper +
+      "');background-size:auto,cover;background-position:top,center top;background-repeat:no-repeat;"
+    : "";
+  return `<div id="chat-frame" style="${herVars(character.color)}${paper}" class="relative flex h-full flex-col overflow-hidden bg-her-wall text-foreground">
     <header class="flex h-14 shrink-0 items-center gap-1 px-2">
       <a href="/conversations" aria-label="${T.chat.back}" class="group/button inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 hover:bg-muted hover:text-foreground md:hidden">${icon("back", "size-6")}</a>
       <div class="flex min-w-0 flex-1 flex-col px-2">
@@ -1464,8 +1482,11 @@ function settingsSummary(category) {
     }
     case "reach-outs":
       return state.reachOuts ? T.settings.summaries.reachOutsOn : T.settings.summaries.reachOutsOff;
-    case "appearance":
-      return state.scsp ? T.settings.summaries.scspAvatarsOn : T.settings.summaries.scspAvatarsOff;
+    case "appearance": {
+      const avatars = state.scsp ? T.settings.summaries.scspAvatarsOn : T.settings.summaries.scspAvatarsOff;
+      const wall = state.scspBg ? T.settings.summaries.scspBackgroundsOn : T.settings.summaries.scspBackgroundsOff;
+      return `${avatars} · ${wall}`;
+    }
     case "own-keys":
       return T.settings.summaries.ownKeysNone;
     case "sign-in":
@@ -2220,6 +2241,12 @@ function settingsPanelBody(category) {
               <label data-slot="field-label" class="${fieldLabelClass}">${T.settings.appearance.scspAvatars}</label>
             </div>
             ${switchEl("toggle-scsp", state.scsp)}
+          </div>
+          <div data-slot="field" data-orientation="horizontal" class="group/field flex w-full flex-row items-center gap-2">
+            <div data-slot="field-content" class="group/field-content flex flex-1 flex-col gap-0.5 leading-snug">
+              <label data-slot="field-label" class="${fieldLabelClass}">${T.settings.appearance.scspBackgrounds}</label>
+            </div>
+            ${switchEl("toggle-scsp-bg", state.scspBg)}
           </div>
         </div>`
       );
@@ -3422,6 +3449,10 @@ function wire() {
         state.scsp = !checked;
         keepAppearance();
       }
+      if (button.id === "toggle-scsp-bg") {
+        state.scspBg = !checked;
+        keepAppearance();
+      }
     });
   });
   document.querySelectorAll("[data-delete-memory]").forEach((button) => {
@@ -3880,7 +3911,9 @@ async function boot() {
       state.userId = out.user_id || "";
       state.prefs = loadPrefs();
       // 外观（SCSP 头像开关）只存在这台设备上，原版 lib/appearance.ts 那样按用户分开存。
-      state.scsp = loadAppearance();
+      const look = loadAppearance();
+      state.scsp = look.scspAvatars;
+      state.scspBg = look.scspBackgrounds;
     }
   } catch {
     state.characters = [];
