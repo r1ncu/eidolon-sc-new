@@ -9,6 +9,16 @@ front of fifty witnesses. So it is three layers:
     idols/<id>.md             one colleague, in detail     when that name is said
     meta.md                   work, events, the people who make them   when that is asked about
 
+and beside each of those a second line that is *hers*, not the world's:
+
+    packs/<id>/view.md        how she calls them, who she is close to   with `office.md`
+    packs/<id>/world.md       how she talks about the work itself       with `meta.md`
+
+Facts and her reading of them are injected together, on purpose. Only the facts and she is a
+narrator reading a wiki; only her reading and she has nothing to stand on. The pack is per
+character, so the second line is the part that changes when somebody else is played — see
+`plugins/packs.py`.
+
 The middle layer is looked up by name, not by meaning: a deterministic match on the names in
 `characters.toml`. That is deliberate. An embedding lookup can return 三峰結華 for a question
 about 幽谷霧子, and being confidently wrong about a colleague is worse than having only the
@@ -66,9 +76,9 @@ MAX_META = 2200
 _NOTE = re.compile(r"<!--.*?-->", re.S)
 """文件里的注释是写给改文件的人看的，不是给她看的。
 
-这几层是**整段注入**的：`office.md` 每轮都在，一份四十行的作品笔记，注释多的时候能有
-十几行进提示词，而它一个字的信息量都没有。以前没人管是因为注释少，所以放在入口统一
-去掉，而不是要求每个写文件的人记得别写注释。"""
+这些层是**整段注入**的：一份 40 行的作品笔记，注释多的时候能有十几行进提示词，而它
+一个字的信息量都没有。以前没人管是因为注释少；现在「共享层 + 视角层」成对进来，两份
+都带注释就翻倍，所以在入口统一去掉。"""
 
 
 def _note_free(text: str) -> str:
@@ -91,14 +101,25 @@ class World:
         limit: int = MAX_HITS,
         settle: float = 0.35,
         log: Any | None = None,
+        work: Any | None = None,
+        pack: Any | None = None,
     ) -> None:
         self._root = Path(characters)
         self._world = self._root / "world"
         self._meta_on = meta
         self._limit = limit
         self._log = log or (lambda line: None)
+        self._pack = pack
+        """`pack(character_id) -> Pack` 或 None。有它才读得到 `packs/<id>/view.md`
+        那一条她自己对世界的看法；没有它，行为和以前一模一样（只有事实）。"""
+        self._settle = settle
+        self._words = tuple(getattr(work, "meta_words", ()) or META_WORDS)
+        """作品话题词：优先 `work.toml`，没有就用这份默认表。"""
         self._office = Live(self._world / "office.md", settle=settle, log=self._log)
         self._meta = Live(self._world / "meta.md", settle=settle, log=self._log) if meta else None
+        self._world_fact = Live(self._world / "work.md", settle=settle, log=self._log)
+        self._extras: dict[str, tuple[Live | None, Live | None]] = {}
+        """每人一对：view（她怎么看同事）/ work（她怎么看作品）。惰性建，按角色缓存。"""
         self._names = Live(
             self._root / (Path(config).name if config else "characters.toml"),
             settle=settle,
@@ -113,28 +134,49 @@ class World:
         self._office.refresh(force=True)
         if self._meta is not None:
             self._meta.refresh(force=True)
+        self._world_fact.refresh(force=True)
         self._names.refresh(force=True)
         for file in self._idols.values():
             file.refresh(force=True)
+        for view, about in self._extras.values():
+            view.refresh(force=True)
+            about.refresh(force=True)
         self._aliases_stamp = ()
 
-    def stamp(self) -> tuple:
+    def stamp(self, character_id: str = "") -> tuple:
         """Changes when a file that feeds the *persona* changes. Colleagues' files are not in
-        it: they arrive as turn sections, which are rebuilt every turn anyway."""
-        return (self._office.stamp(), self._meta.stamp() if self._meta else (0, 0),
-                self._names.stamp())
+        it: they arrive as turn sections, which are rebuilt every turn anyway.
+
+        `character_id` matters because 「她怎么看这些人」 是 persona 的一半：换人必须换提示词，
+        改她的 view 也必须换。给空串时只算共享那几份（测试和没有角色在场的调用）。"""
+        view, about = self._pair(character_id)
+        return (
+            self._office.stamp(),
+            self._meta.stamp() if self._meta else (0, 0),
+            self._world_fact.stamp(),
+            self._names.stamp(),
+            view.stamp() if view is not None else (0, 0),
+            about.stamp() if about is not None else (0, 0),
+        )
 
     @property
     def ready(self) -> bool:
         """Whether the roster file was found. Without it she still talks, from her sheet."""
         return bool(self._office.text())
 
-    def persona(self) -> Section | None:
-        """The one-line-each roster, for the engine the channel builds."""
-        text = _note_free(self._office.text())
-        if not text:
+    def persona(self, character_id: str = "") -> Section | None:
+        """The one-line-each roster **and her reading of it**, for the engine she builds.
+
+        One section, not two: both halves go in the persona slot, which is cached with the
+        sheet — and the pair is what makes her recognise a colleague *the way she would*
+        (「あさひちゃん」, not 「芹沢あさひ」). Without a pack this is exactly what it was.
+        """
+        roster = _note_free(self._office.text())
+        view = self._her(character_id, "view")
+        body = "\n\n".join(part for part in (roster, view) if part)
+        if not body:
             return None
-        return Section(Slot.PERSONA, text, order=10, title="world:office")
+        return Section(Slot.PERSONA, body, order=10, title="world:office")
 
     def lookup(self, text: str, *, speaking: str = "") -> list[Section]:
         """Colleagues named in the message, in the order they are named.
@@ -162,15 +204,62 @@ class World:
                 )
         return sections
 
-    def knowledge(self, text: str) -> list[Section]:
-        """The work itself — releases, events, the people who make them."""
-        meta = _note_free(self._meta.text()) if self._meta is not None else ""
-        if not self._meta_on or not meta:
+    def knowledge(self, text: str, character_id: str = "") -> list[Section]:
+        """The work itself — releases, events, the people who make them — and, beside it,
+        what she makes of it.
+
+        `world/work.md` is the shared fact file; `world/meta.md` is the older name for the
+        same thing and still answers when the new file is not there yet. Her half comes from
+        `packs/<id>/world.md` and is added only when there *is* one: an empty second section
+        would read as 「她对这件事没有看法」, which is a different statement from 「没写」.
+        """
+        if not self._meta_on:
+            return []
+        fact = self._work_text()
+        view = self._her(character_id, "world")
+        if not fact and not view:
             return []
         said = (text or "").casefold()
-        if not any(word.casefold() in said for word in META_WORDS):
+        if not any(word.casefold() in said for word in self._words):
             return []
-        return [Section(Slot.TURN, meta[:MAX_META], title="world:meta")]
+        sections: list[Section] = []
+        if fact:
+            sections.append(Section(Slot.TURN, fact[:MAX_META], title="world:work"))
+        if view:
+            sections.append(
+                Section(Slot.TURN, view[:MAX_META], title=f"world:view:{character_id}")
+            )
+        return sections
+
+    # ---- the two halves of one person
+
+    def _work_text(self) -> str:
+        """`world/work.md` first, then the file it replaced."""
+        fresh = _note_free(self._world_fact.text())
+        if fresh:
+            return fresh
+        return _note_free(self._meta.text() if self._meta is not None else "")
+
+    def _pair(self, character_id: str) -> tuple[Live | None, Live | None]:
+        """Her view of the office and of the work, lazily, one pair per character."""
+        if not character_id or self._pack is None:
+            return None, None
+        found = self._extras.get(character_id)
+        if found is None:
+            pack = self._pack(character_id)
+            view = pack.path("view") if pack is not None else None
+            about = pack.path("world") if pack is not None else None
+            found = (
+                Live(view, settle=self._settle, log=self._log) if view else None,
+                Live(about, settle=self._settle, log=self._log) if about else None,
+            )
+            self._extras[character_id] = found
+        return found
+
+    def _her(self, character_id: str, kind: str) -> str:
+        view, about = self._pair(character_id)
+        file = view if kind == "view" else about
+        return _note_free(file.text()) if file is not None else ""
 
     def _idol(self, character_id: str) -> str:
         file = self._idols.get(character_id)

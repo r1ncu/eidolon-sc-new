@@ -136,16 +136,18 @@ class QQService(Plugin):
         self._clock = lambda: datetime.now(_zone(self.app.settings.timezone))
         # Her own space, next to her own voice: the post is written from the same character
         # and published through the same socket, but on a calendar of its own.
+        # 同一个人、同一个包：`packs/<id>/` 优先，旧扁平名兜底。这里解析一次，下面都用它。
+        files = app.characters.pack(self.config.character) if self.config.character else None
+
+        def own(kind: str):
+            return files.path(kind) if files is not None else None
+
         self.qzone = space.Qzone(
             self.client,
             app.llm,
             app.store,
             character=self.config.character,
-            persona=qq.world_path(
-                app.settings.characters, f"{self.config.character}-qzone.md"
-            )
-            if self.config.character
-            else None,
+            persona=own("qzone"),
             flags=self.pack,
             ugc_right=self.config.qzone_right,
             hour=self.config.qzone_hour,
@@ -168,11 +170,7 @@ class QQService(Plugin):
             app.llm,
             app.store,
             web=self.web,
-            persona=qq.world_path(
-                app.settings.characters, f"{self.config.character}-qzone.md"
-            )
-            if self.config.character
-            else None,
+            persona=own("qzone"),
             flags=self.pack,
             self_id=self.config.self_id,
             # 全局忽略名单也在这里生效：`QQ_IGNORE_IDS` 是「完全不理的号」，一个在群里
@@ -202,15 +200,13 @@ class QQService(Plugin):
                 config=app.settings.characters_config,
                 meta=self.config.meta,
                 log=self._log,
+                work=getattr(app.characters, "work", None),
+                pack=getattr(app.characters, "pack", None),
             ),
             presence=Presence(
-                qq.world_path(app.settings.characters, f"{self.config.character}-qq.md"),
-                direct=qq.world_path(app.settings.characters, f"{self.config.character}-dm.md"),
-                stage=qq.world_path(
-                    app.settings.characters, f"{self.config.character}-stage.toml"
-                )
-                if self.config.character
-                else None,
+                own("qq"),
+                direct=own("dm"),
+                stage=own("stage"),
                 log=self._log,
                 owner_stage=self.config.owner_stage,
             ),
@@ -499,6 +495,50 @@ class QQService(Plugin):
             "QQ 通道已启动：" + self.config.where()
             + f" / 角色 {self.config.character} / {self.config.ws}"
         )
+        # 读的是哪几份文件，说清楚。文件缺了不会报错（有中性退路），所以「用错文件」
+        # 曾经只能从语气听出来——这一行就是让它一眼看得见。
+        self._log(self._pack_report())
+        self._log(self._calendar_report())
+
+    def _calendar_report(self) -> str:
+        """一行：这是哪个国家的日历、覆盖到哪一年、今晚按哪种作息。
+
+        祝日表是按年更新的；表里没有的年份会退成「只看周末」。这一行就是让人记得更新的
+        地方——不然她会在大晦日晚上十一点准时睡觉，而没人知道为什么。
+        """
+        cal = getattr(self.channel, "calendar", None)
+        local = qq._local_time(datetime.now(timezone.utc), self.app.settings.timezone)
+        day = local.date()
+        today = "休み" if (cal.is_off(day) if cal else day.weekday() >= 5) else "平日"
+        note = (cal.name(day) if cal else "") or ""
+        span = ""
+        if cal is not None:
+            info = cal.as_dict()
+            span = f"，表里有 {info['from']}–{info['to']} 共 {info['count']} 天" if info["count"] else "，没有祝日表"
+        return (
+            f"作息：{day.isoformat()}（{'周末' if day.weekday() >= 5 else '工作日'}，{today}"
+            + (f"·{note}" if note else "")
+            + f"）/ 明天要上班就 {qq.REST_HOURS[0]}:00 睡，不上班就掷 0–{qq.MAX_LATE_HOURS} 小时"
+            f"{span}"
+        )
+
+    def _pack_report(self) -> str:
+        """一行：这个角色的包在哪、哪几份还在旧路径、哪几份根本没写。"""
+        try:
+            pack = self.app.characters.pack(self.config.character)
+        except Exception:
+            return "角色包：解析失败（角色册不可用）"
+        ready = pack.compact()
+        if not ready["home"] and not ready["fallback"]:
+            return f"角色包：没有找到任何文件（{self.config.character}）"
+        parts = [f"角色包 {pack.home.name}"]
+        if ready["home"]:
+            parts.append(f"在 {ready['home']}")
+        if ready["fallback"]:
+            parts.append("旧路径：" + "、".join(ready["fallback"]))
+        if ready["missing"]:
+            parts.append("未写：" + "、".join(ready["missing"]))
+        return " / ".join(parts)
 
     def stop(self) -> None:
         loop, thread = self._loop, self._thread
@@ -599,8 +639,10 @@ class QQService(Plugin):
             self._log(
                 f"qq: 恋爱之后她会先发消息（间隔 {self.config.love_ping_min:g}–"
                 f"{self.config.love_ping_max:g} 分钟，只在作息时段——工作日 "
-                f"{qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00、休息日 "
-                f"{qq.HOLIDAY_REST_HOURS[0]}:00–{qq.HOLIDAY_REST_HOURS[1]}:00 以外，日本时间）"
+                f"{qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00；第二天不上班时 {qq.REST_HOURS[0]}:00 "
+                f"+ 掷到的 0–{qq.MAX_LATE_HOURS} 小时（最晚 "
+                f"{qq.REST_HOURS[0] + qq.MAX_LATE_HOURS - 24}:00）–{qq.REST_HOURS[1]}:00。"
+                f"日本时间）"
             )
         if self.config.ambient and self.config.ambient_idle > 0 and self.config.groups:
             # Off by default: a bot that starts talking into a quiet room is the feature most
@@ -609,9 +651,9 @@ class QQService(Plugin):
             self._spawn(self._idle())
             self._log(
                 f"qq: 安静 {int(self.config.ambient_idle)} 分钟以上时，她可能自己开口"
-                f"（工作日 {qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00、"
-                f"休息日 {qq.HOLIDAY_REST_HOURS[0]}:00–{qq.HOLIDAY_REST_HOURS[1]}:00 以外；"
-                f"有人 @ 她照回）"
+                f"（工作日 {qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00；第二天不上班的晚上 23:00 "
+                f"掷骰子，熬 0–{qq.MAX_LATE_HOURS} 小时，最晚 "
+                f"{qq.REST_HOURS[0] + qq.MAX_LATE_HOURS - 24}:00；有人 @ 她照回）"
             )
         if self.config.image:
             # 说清楚是哪一种：假画家出的东西是一块纯色，不是照片。

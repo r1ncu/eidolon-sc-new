@@ -202,7 +202,7 @@ class Interest:
         self, lines: Sequence[dict[str, str]], *, direct: bool
     ) -> list[ChatMessage]:
         heard = "\n".join(
-            f"{number}. {line.get('card') or '誰か'}：{line.get('text') or ''}"
+            f"{number}. {_who(line)}：{line.get('text') or ''}"
             for number, line in enumerate(lines, 1)
         )
         return [
@@ -238,7 +238,7 @@ class Interest:
         mention: Mention | None = None,
     ) -> list[ChatMessage]:
         heard = "\n".join(
-            f"{number}. {line.get('card') or '谁'}：{line.get('text') or ''}"
+            f"{number}. {_who(line)}：{line.get('text') or ''}"
             for number, line in enumerate(lines, 1)
         )
         return [
@@ -295,6 +295,19 @@ class Interest:
     def _text(self) -> str:
         raw = self._src.text() if self._src is not None else ""
         return (raw or "").strip() or DEFAULT
+
+
+def _who(line: dict[str, str]) -> str:
+    """The speaker, with what the channel knows about them in one bracket.
+
+    Same rule as the channel's own transcript (`qq._name_of`), duplicated because this module
+    is what both channels share and must not import either of them: a line from somebody who
+    renamed themselves after her is 「黛冬优子（跟你同名，不是你）」, not 「黛冬优子」 — the
+    judge picking a line to answer has the same reason to be sure as she does.
+    """
+    name = str(line.get("card") or "谁")
+    extra = [part for part in (line.get("marks"), line.get("note")) if part]
+    return f"{name}（{'；'.join(extra)}）" if extra else name
 
 
 async def _text(llm: LLM, messages: Sequence[ChatMessage]) -> str:

@@ -22,6 +22,37 @@ SHEET = "# 人设：测试角色\n\n你是测试角色，说话简短。\n"
 PAGE = "<html><title>test</title></html>"
 
 
+class TestTheWorldIsData(unittest.TestCase):
+    """页面要知道「这份人设是从哪读的」：作品是共享的，包是每人一份的。"""
+
+    def test_state_carries_the_work_and_the_pack(self):
+        tmp = tempfile.TemporaryDirectory()
+        # 注册顺序是 LIFO：先注册目录清理、再注册 app.close，关库才会发生在删目录之前。
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "characters" / "sheets").mkdir(parents=True)
+        (root / "characters" / "characters.toml").write_text(
+            '[[characters]]\nid = "test"\nname = "テスト"\ncolor = "#8ab4f8"\n',
+            encoding="utf-8",
+        )
+        (root / "characters" / "sheets" / "test.md").write_text("# 人设\n", encoding="utf-8")
+        (root / "characters" / "work.toml").write_text(
+            '[work]\ntitle_zh = "作品"\n[aliases]\nwords = ["生放送"]\n', encoding="utf-8"
+        )
+        settings = Settings(
+            base_url="http://unused", api_key="unused", model="fake",
+            db=str(root / "db.sqlite"), characters=str(root / "characters"),
+            media=str(root / "media"), turns_per_hour=0,
+        )
+        app = App(settings, ScriptedLLM("{}"))
+        self.addCleanup(app.close)
+        state = app.state()
+        self.assertTrue(state["work"]["named"])
+        self.assertEqual(state["work"]["title_zh"], "作品")
+        self.assertIn("pack", state["characters"][0])
+        self.assertIn("missing", state["characters"][0]["pack"])
+
+
 class TestServer(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

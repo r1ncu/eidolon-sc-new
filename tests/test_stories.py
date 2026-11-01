@@ -113,7 +113,11 @@ class StoriesTest(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
         (self.root / "world").mkdir()
         (self.root / "world" / "fuyuko-stories.toml").write_text(TABLE, encoding="utf-8")
-        self.stories = Stories(self.root, on=True)
+        # 卡名尾由角色册给：这里模拟「这一位叫黛冬優子」，三种写法都剥。
+        # 以前是写死在 `plugins/stories.py` 里的，换角色就剥不干净。
+        self.stories = Stories(
+            self.root, on=True, tails=lambda cid: ("黛冬優子", "黛 冬優子", "黛冬优子")
+        )
 
     # ---- the match itself
 

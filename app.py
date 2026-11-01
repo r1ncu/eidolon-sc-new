@@ -57,6 +57,23 @@ RANGE_DAYS: dict[str, int | None] = {"30d": 30, "1y": 365, "all": None}
 """每个跨度取多少天，今天算最后一天；「全部」是 None。"""
 
 
+class _LazyEngines(dict):
+    """A dict of engines that builds one the first time it is asked for.
+
+    `dict` subclass on purpose: the kernel indexes it (`app.engines[character.id]`) and the
+    page iterates it, and both keep working. `__missing__` is the only new behaviour.
+    """
+
+    def __init__(self, build: Any) -> None:
+        super().__init__()
+        self._build = build
+
+    def __missing__(self, key: str) -> Any:
+        engine = self._build(key)
+        self[key] = engine
+        return engine
+
+
 class App:
     """Everything the handlers need, built once."""
 
@@ -68,11 +85,20 @@ class App:
             base_url=settings.base_url, api_key=settings.api_key, model=settings.model
         )
         self.llm = chat
+        # 作品是共享的（`characters/work.toml`），两个插件的提示里各有一处提到它——
+        # 它们是「这个 deployment 在演什么」，不是「这个人是谁」，所以从这里注入。
         self.affinity = Affinity(
-            self.store, labels=self.characters.name_of, start=settings.affinity_start
+            self.store,
+            labels=self.characters.name_of,
+            start=settings.affinity_start,
+            work=self.characters.work,
         )
         self.memory = Memory(
-            self.store, llm=chat, names=self.characters.name_of, timezone_name=settings.timezone
+            self.store,
+            llm=chat,
+            names=self.characters.name_of,
+            timezone_name=settings.timezone,
+            work=self.characters.work,
         )
         self.profile = Profile(self.store)
         self.photos = Photos(self.store, settings.media, per_hour=settings.photos_per_hour)
@@ -124,6 +150,9 @@ class App:
         self.stories = Stories(
             settings.characters,
             on=settings.stories == "on",
+            # 剧情目录与卡名尾都进角色包：换人不改代码，也不靠写死「黛冬優子」。
+            pack=self.characters.pack,
+            tails=self.characters.card_tails,
         )
 
         # The judge reads the producer's words, not the reply, so one model is enough:
@@ -179,18 +208,26 @@ class App:
         return True
 
     def _build_engines(self) -> None:
-        chat = self.llm
-        self.engines = {
-            character.id: Engine(
-                self.store,
-                chat,
-                base=_base_sections(character, self.recall),
-                host=self.host,
-                history_turns=self.settings.history_turns,
-                voiced_by=self.settings.voiced_by,
-            )
-            for character in self.characters.roster
-        }
+        """The engines, built **when somebody asks for one**.
+
+        It used to build all twenty-eight at startup, on the argument that a page request
+        might want any of them. Nobody wants twenty-eight: a deployment plays one character
+        in QQ and the page plays the one you opened. Building on demand is the difference
+        between a second of startup and a memory bill for prompts nobody read — and it makes
+        adding a character cost nothing until she is actually spoken to.
+        """
+        self.engines = _LazyEngines(self._engine_for)
+
+    def _engine_for(self, character_id: str) -> Engine:
+        character = self.characters.character(character_id)
+        return Engine(
+            self.store,
+            self.llm,
+            base=_base_sections(character, self.recall, self.characters.pack(character.id)),
+            host=self.host,
+            history_turns=self.settings.history_turns,
+            voiced_by=self.settings.voiced_by,
+        )
 
     # ---- who and where
 
@@ -271,7 +308,10 @@ class App:
             "user_id": self.user_id,
             "character": _brief(character),
             "conversation_id": conversation.id,
-            "characters": [_brief(c) for c in self.characters.roster],
+            # 作品（共享）与每人一份的角色包：页面要把「这份人设是从哪读的」显示出来，
+            # 否则换角色之后「语气怪」只能靠猜。`tell` 是 brief + pack，字段只增不改。
+            "work": self.characters.work.as_dict(),
+            "characters": [self.characters.tell(c) for c in self.characters.roster],
             "capabilities": capabilities,
             "affinity": self.affinity.read(self.user_id, character.id).as_dict(),
             "memories": self.memory.everything(self.user_id),
@@ -706,13 +746,27 @@ def _visits(days, today: date) -> dict:
     return {"current": current, "longest": longest}
 
 
-def _base_sections(character: Character, recall: Recall) -> tuple[Section, ...]:
-    """人设，和（选了整份资料时）她的资料。两者都在 `persona` 槽：对同一个角色不变，
-    跟着人设一起被服务商缓存，所以整份资料的代价只是第一次的提示词长度。"""
+def _base_sections(
+    character: Character, recall: Recall, pack: object | None = None
+) -> tuple[Section, ...]:
+    """人设、她的资料、她对世界的看法——都在 `persona` 槽。
+
+    三份都在这里，是因为它们对同一个角色不变：跟着人设一起被服务商缓存，代价只是第一次
+    的提示词长度。第三份（`packs/<id>/view.md`）是网页端的「视角层」：QQ 通道每轮都会
+    带它，页面如果不带，同一个人在两个地方的语气就会分叉——这正是这次改造要消掉的东西。
+    """
     sections = [Section(Slot.PERSONA, character.sheet, title=character.id)]
     facts = recall.persona(character.id)
     if facts.strip():
         sections.append(Section(Slot.PERSONA, facts, title=f"{character.id}:facts"))
+    view = ""
+    if pack is not None:
+        try:
+            view = str(pack.text("view") or "").strip()
+        except Exception:
+            view = ""
+    if view:
+        sections.append(Section(Slot.PERSONA, view, title=f"{character.id}:view"))
     return tuple(sections)
 
 

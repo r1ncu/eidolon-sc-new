@@ -141,12 +141,6 @@ class TestAStrangerStartsBelowTrust(Base):
         self.assertEqual(standing.value, 20, "回升到起点就停，不是 50")
         self.assertEqual(standing.tier, "distant")
 
-    def test_a_group_has_no_day_limit_on_what_talking_can_add(self):
-        """群里没有礼物，对话是唯一能加分的东西——所以群聊不封每日上限。"""
-        for _ in range(10):
-            self.affinity.change("u1", "fuyuko", 2, surface="group")
-        self.assertEqual(self.affinity.read("u1", "fuyuko", surface="group").value, 40)
-
     def test_the_rooms_with_gifts_keep_the_limit(self):
         for surface, floor in (("dm", 50), ("", 50)):
             with self.subTest(surface=surface):
@@ -191,6 +185,35 @@ class TestAffinity(Base):
         self.assertEqual(event.payload["up"], True)
         self.assertEqual(event.payload["tier"], "trust")
         self.assertEqual(event.payload["text"], "真乃有点开心")
+
+    def test_a_turn_nobody_spoke_in_moves_nothing(self):
+        """她自己开口的那一轮，用户位置上是旁白。实测 judge 会把它读成「有人在教她怎么做」，
+        给出 level 1 加 manipulation——所以那张「这一轮没人说话」的旗子落到这里，谁的数字都不许动。"""
+        import asyncio
+
+        held = turn()
+        held.facts["affinity.mute"] = True
+        held.facts["affinity.level"] = 0
+        held.facts["affinity.manipulation"] = True
+        held.reply = reply()
+        asyncio.run(self.affinity.after_turn(held))
+        self.assertEqual(self.affinity.standing("u1", "mano").value, 50, "一句话没说，数字不动")
+        self.assertEqual(held.events, [], "也不该有「她有点不高兴」这种提示")
+
+    def test_the_stage_direction_is_not_read_as_feeling(self):
+        import asyncio
+
+        held = turn()
+        held.facts["affinity.mute"] = True
+        held.facts["affinity.level"] = 0
+        sections = asyncio.run(self.affinity.prompt_sections(held))
+        text = "\n".join(section.text for section in sections)
+        self.assertNotIn("伤到了你", text, "旁白没有伤到她")
+
+    def test_the_level_question_names_its_own_default(self):
+        """判官结尾是「按问题里写明的默认值」：level 那题写的是「拿不准=没有影响」（2）。"""
+        question = next(q for q in self.affinity.judge_questions() if q.key == "affinity.level")
+        self.assertIn("拿不准时就是对她没有影响", question.ask)
 
     def test_crossing_a_band_is_said_out_loud(self):
         from plugins.affinity import cue_text

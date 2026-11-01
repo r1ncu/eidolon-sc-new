@@ -14,7 +14,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from channels import digest as digest_module
@@ -29,6 +29,7 @@ from core.llm import ScriptedLLM
 from core.protocol import Segment
 from core.settings import Settings
 from core.store import Store
+from plugins import affinity
 from serve import App
 
 SHEET = "# 人设：测试角色\n\n你是测试角色，说话简短。\n"
@@ -389,6 +390,48 @@ class TestWorld(unittest.TestCase):
         self.assertEqual(section.slot.value, "persona")
         self.assertIn("あさひちゃん", section.text)
 
+    def _with_pack(self, files: dict[str, str]):
+        """同一个 root，换成「有角色包」的世界：事实还是共享的，视角从包里来。"""
+        root = Path(self.tmp.name)
+        for name, body in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        from plugins import packs as pack_file
+
+        world = World(root, pack=lambda cid: pack_file.Pack(root, cid))
+        return world
+
+    def test_her_view_of_the_office_rides_with_the_roster(self):
+        """两条线成对：名单是共享的，「她怎么叫他们」是她的。少了后一半，她就是在念维基。"""
+        world = self._with_pack({"packs/x/view.md": "你叫あさひ「あさひちゃん」，叫真乃「真乃ちゃん」。"})
+        section = world.persona("x")
+        self.assertIn("あさひちゃん", section.text, "共享的事实还在")
+        self.assertIn("你叫あさひ", section.text, "她的读法也进来了")
+
+    def test_a_character_with_no_view_gets_the_roster_alone(self):
+        world = self._with_pack({})
+        self.assertNotIn("你叫あさひ", world.persona("x").text)
+
+    def test_the_work_facts_and_her_reading_come_together(self):
+        world = self._with_pack({"packs/x/world.md": "这些事你知道，但不主动讲釈。"})
+        titles = [section.title for section in world.knowledge("生放送の話", "x")]
+        self.assertEqual(titles, ["world:work", "world:view:x"])
+
+    def test_her_reading_alone_can_answer_when_there_are_no_facts(self):
+        """作品事实文件缺了、她那一半在：宁可只给她自己的立场，也不要一个字都不提。"""
+        root = Path(self.tmp.name)
+        (root / "world" / "meta.md").unlink()
+        world = self._with_pack({"packs/x/world.md": "你不承认自己是游戏里的登场人物。"})
+        titles = [section.title for section in world.knowledge("生放送", "x")]
+        self.assertEqual(titles, ["world:view:x"])
+
+    def test_the_work_file_wins_over_the_one_it_replaced(self):
+        world = self._with_pack({"world/work.md": "作品的事実（新）"})
+        text = "\n".join(section.text for section in world.knowledge("生放送", "x"))
+        self.assertIn("作品的事実（新）", text)
+        self.assertNotIn("アニメも、楽曲も", text, "旧的 meta.md 不该同时进来")
+
     def test_a_named_colleague_is_looked_up(self):
         hits = self.world.lookup("芹沢あさひってどんな子？")
         self.assertTrue(hits)
@@ -461,6 +504,14 @@ class ChannelCase(unittest.IsolatedAsyncioTestCase):
         # a separate instance so it never shows up in `app.llm.seen`.
         self.channel.interest = interests.Interest(
             ScriptedLLM('{"speak": true, "to": 2, "why": "接得上"}', size=64)
+        )
+
+    def enable_private(self) -> None:
+        """One room and a private chat at once: the room is where she talks, the DM is where
+        the producer gives orders — a few cases need both in the same test."""
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",), private=True,
+            character="test", merge_seconds=0.0, member_cooldown=0.0,
         )
 
     async def say(self, payload: dict) -> None:
@@ -875,6 +926,13 @@ class Coin:
     def choice(self, rows):
         return rows[0]
 
+    def randint(self, low: int, high: int) -> int:
+        """掷骰子（作息用）：脚本里给整数就给整数，没给就取最保守的 0。"""
+        for index, value in enumerate(self.values):
+            if float(value) != value or not 0 <= value <= 1:
+                return int(self.values.pop(index))
+        return low
+
 
 class TestPack(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1139,7 +1197,8 @@ class TestIgnoreList(ChannelCase):
     async def test_a_person_one_id_over_is_still_heard(self):
         await self.say(event("我是一句普通的话", qq="78", message_id="b2", at=""))
         heard = self.channel._heard.get("100") or []
-        self.assertEqual([line["qq"] for line in heard], ["78"])
+        # 她自己插的那两句也在这张窗口里（`_remember_self`），标着 self；这里只看别人的话。
+        self.assertEqual([line["qq"] for line in heard if not line.get("self")], ["78"])
 
 
 class TestThreads(ChannelCase):
@@ -1258,12 +1317,382 @@ class TestHerOwnThoughts(AmbientCase):
         self.assertTrue(self.client.texts, "a thought is words")
         self.assertEqual(self.client.calls[0][1]["message"][0]["type"], "text")
 
+    async def test_a_thought_of_her_own_does_not_move_anybody_s_affinity(self):
+        """旁白不是「他说的话」。judge 读到它会判 level 1，于是这个群友白掉两点。"""
+        self.use(ambient_own_p=1.0)
+        seen: dict = {}
+        original = self.app.turn
+
+        def wrap(*args, **kwargs):
+            seen["facts"] = kwargs.get("extra_facts") or {}
+            return original(*args, **kwargs)
+
+        self.app.turn = wrap
+        self.addCleanup(setattr, self.app, "turn", original)
+        await self.quiet("雨だね", message_id="a")
+        self.assertTrue(seen["facts"].get("affinity.mute"))
+
+    async def test_an_interjection_does_not_move_anybody_s_number(self):
+        """她接的是**别人对屋里说的话**：那人没跟她说，她插一句不该改他的数字。
+
+        这条以前是反的——旁听接话照旧走 judge，理由「那是真的有人在说话」。话是真的，
+        可它不是对她说的：一个人自言自语，被她听见了，于是加两分，这跟她没关系。
+        """
+        self.use(ambient_own_p=0.0)
+        seen: dict = {}
+        original = self.app.turn
+
+        def wrap(*args, **kwargs):
+            seen["facts"] = kwargs.get("extra_facts") or {}
+            return original(*args, **kwargs)
+
+        self.app.turn = wrap
+        self.addCleanup(setattr, self.app, "turn", original)
+        await self.quiet("新曲のMV見た？", message_id="a")
+        await self.quiet("まだ見てない", message_id="b")
+        self.assertTrue(seen["facts"].get("affinity.mute"), "旁听的一轮不记账")
+        self.assertNotIn("judge.brief", seen["facts"], "不判分就不用给判官背景")
+
     async def test_she_still_does_not_at_anyone(self):
         self.use(ambient_own_p=1.0)
         await self.quiet("雨だね", message_id="a")
         kinds = [segment["type"] for segment in self.client.calls[0][1]["message"]]
         self.assertNotIn("at", kinds)
         self.assertNotIn("reply", kinds)
+
+
+class TestSheRemembersWhatSheSaid(AmbientCase):
+    """她插完一句之后，那句话也留在房间里。
+
+    报上来的毛病是「她对自己搭话说过的话没有记忆」：房间里那张小窗口只收别人说的话，所以
+    有人接她的话时，那一句在她眼里是凭空冒出来的；再往后她只能说「我没说过」或者自己补一段。
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            character="test", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=True, ambient_p=1.0, ambient_gap=0.0, ambient_check=0.0,
+            ambient_heard=8, ambient_sticker_p=0.0, ambient_own_p=0.0,
+        )
+
+    def judge(self, answer: str) -> None:
+        self.channel.interest = interests.Interest(ScriptedLLM(answer, size=64))
+
+    def spy(self) -> dict:
+        seen: dict = {}
+        original = self.app.turn
+
+        def wrap(*args, **kwargs):
+            seen["text"] = args[1] if len(args) > 1 else kwargs.get("text")
+            seen["sections"] = kwargs.get("sections") or []
+            return original(*args, **kwargs)
+
+        self.app.turn = wrap
+        self.addCleanup(setattr, self.app, "turn", original)
+        return seen
+
+    async def test_her_own_line_joins_the_room(self):
+        await self.quiet("新曲のMV見た？", message_id="a")
+        await self.quiet("まだ見てない", qq="44", message_id="b")
+        self.assertEqual(self.client.texts, ["早上好", "今天真早啊"], "她插了一句，两段")
+        heard = list(self.channel._heard["100"])
+        mine = [line for line in heard if line.get("self")]
+        self.assertEqual([line["text"] for line in mine], ["早上好", "今天真早啊"])
+        self.assertEqual(
+            {line["card"] for line in mine}, {qq_module.SELF_LINE},
+            "她自己的话要看得出来是她的，不能挂别人的名字",
+        )
+
+    async def test_the_next_turn_shows_them_as_hers(self):
+        seen = self.spy()
+        await self.quiet("新曲のMV見た？", message_id="a")
+        await self.quiet("まだ見てない", qq="44", message_id="b")
+        seen.pop("sections", None)
+        await self.quiet("それってどういうこと", qq="45", message_id="c")
+        text = "\n".join(section.text for section in seen["sections"])
+        self.assertIn(qq_module.SELF_LINE, text, "下一轮要看得见「我刚才说过」")
+        self.assertIn("早上好", text)
+        self.assertIn("それってどういうこと", text, "别人的话也照旧在")
+
+    async def test_she_does_not_answer_herself(self):
+        await self.quiet("新曲のMV見た？", message_id="a")
+        await self.quiet("まだ見てない", qq="44", message_id="b")
+        # 窗口现在是 [a, b, 她自己两条]。判断挑中第 4 行——那是她自己说的话。
+        self.judge('{"speak": true, "to": 4}')
+        seen = self.spy()
+        await self.quiet("で、どうなの", qq="45", message_id="c")
+        self.assertEqual(seen["text"], "まだ見てない", "改成她这一句之前最近的一句别人的话")
+
+    async def test_her_own_words_are_not_somebody_else_talking(self):
+        """接话要有一个别人的话头。她自己那两句不算——否则她会对着一句「あ、そう」自问自答。"""
+        self.channel.config = replace(self.channel.config, ambient_heard=3)
+        await self.quiet("新曲のMV見た？", message_id="a")
+        await self.quiet("まだ見てない", qq="44", message_id="b")
+        self.assertTrue(self.client.texts)
+        before = len(self.client.calls)
+        await self.quiet("あ、そう", qq="45", message_id="c")
+        self.assertEqual(len(self.client.calls), before, "前面只剩她自己的话，没有可接的")
+
+
+STAGE_TOML = """\
+[names]
+self = "ふゆ"
+owner = "制作人"
+mentions = "ふゆ、冬優子、黛冬优子、冬优子、黛冬优子"
+"""
+
+
+class TestSomebodyWithHerName(AmbientCase):
+    """群里有人把名片改成了她的名字（同好、cos、另一个冬优子 bot）。
+
+    窗口里那行于是就叫「黛冬优子：…」，和她自己的话长得一样；只靠语义去分，分错的代价是
+    「那句，ふゆ刚说过」。所以她那一侧的标签要说清楚这是谁——但 `card` 本身不动，它还要
+    被写进 `qq_identities.group_card`。
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        path = Path(self.tmp.name) / "characters" / "world" / "test-stage.toml"
+        path.write_text(STAGE_TOML, encoding="utf-8")
+        self.channel.stage = stage_file.load(path)
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            character="test", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=True, ambient_p=1.0, ambient_gap=0.0, ambient_check=0.0,
+            ambient_heard=8, ambient_sticker_p=0.0, ambient_own_p=0.0,
+            bots=(("77", "asahi"),),
+        )
+
+    def said(self, text: str, *, qq: str, card: str, message_id: str) -> dict:
+        payload = event(text, qq=qq, message_id=message_id, at="")
+        payload["sender"]["card"] = card
+        return payload
+
+    def spy(self) -> dict:
+        seen: dict = {}
+        original = self.app.turn
+
+        def wrap(*args, **kwargs):
+            seen["sections"] = kwargs.get("sections") or []
+            return original(*args, **kwargs)
+
+        self.app.turn = wrap
+        self.addCleanup(setattr, self.app, "turn", original)
+        return seen
+
+    def rows(self) -> list[dict]:
+        return [row for row in self.channel._heard.get("100", []) if not row.get("self")]
+
+    async def test_the_line_is_marked_but_the_name_stays_clean(self):
+        await self.say(self.said("ふゆ是ふゆ。", qq="88", card="黛冬优子", message_id="a"))
+        row = self.rows()[-1]
+        self.assertEqual(row["card"], "黛冬优子", "card 要保持干净，它会被写进身份表")
+        self.assertIn("跟你同名，不是你", row["marks"])
+
+    async def test_the_room_transcript_says_which_one_is_she(self):
+        seen = self.spy()
+        await self.say(self.said("ふゆ是ふゆ。", qq="88", card="黛冬优子", message_id="a"))
+        await self.say(self.said("まだ見てない", qq="89", card="路人乙", message_id="b"))
+        text = "\n".join(section.text for section in seen["sections"])
+        self.assertIn("黛冬优子（跟你同名，不是你）：ふゆ是ふゆ。", text)
+        self.assertIn("路人乙：まだ見てない", text, "别人不用加这个标签")
+        self.assertNotIn("黛冬优子：", text, "裸的名字会读成她自己")
+
+    async def test_a_bot_with_her_name_does_not_count_as_calling_her(self):
+        """它自己就叫 ふゆ。一叫就回，是把一次模仿变一场对话——那晚就是这么吵起来的。"""
+        await self.say(self.said("ふゆ是ふゆ。", qq="77", card="黛冬优子", message_id="a"))
+        self.assertEqual(self.client.texts, [], "当成旁听，不当天被点名")
+        self.assertEqual(self.rows()[-1]["card"], "黛冬优子")
+
+    async def test_a_person_who_took_her_name_is_still_heard_when_they_at_her(self):
+        """人不一样：名片撞了不等于不能找她。
+
+        裸名字不认（分不清是在叫她还是说他自己），**@ 认**——那一个不会被误读，也是
+        同名常客唯一剩下的门。
+        """
+        await self.say(self.said("ふゆ、これ見て", qq="88", card="黛冬优子", message_id="a"))
+        self.assertEqual(self.client.texts, [], "裸名字：可能是在说他自己")
+        at = event("これ見て", qq="88", message_id="b")
+        at["sender"]["card"] = "黛冬优子"
+        await self.say(at)
+        self.assertTrue(self.client.texts, "@ 了就是叫她：这条不能也堵上")
+
+    async def test_another_bot_is_named_as_one_even_when_she_is_just_listening(self):
+        """`QQ_BOTS` 的说明以前只在有人跟她说话时注入；旁听时那段台词被当成陌生群友的寒暄。"""
+        seen = self.spy()
+        await self.say(self.said("ルカだよ", qq="77", card="路加", message_id="a"))
+        await self.say(self.said("まだ見てない", qq="89", card="路人乙", message_id="b"))
+        text = "\n".join(section.text for section in seen["sections"])
+        self.assertIn("路加（另一个 bot，不是人）：ルカだよ", text)
+
+    async def test_the_note_and_the_marks_share_one_bracket(self):
+        await self.say(self.said("ふゆ是ふゆ。", qq="88", card="黛冬优子", message_id="a"))
+        note = self.channel.identities.note("88")
+        heard = [{**self.rows()[-1], "note": "女性"}]
+        text = qq_module._lines(heard, 600)
+        self.assertIn("黛冬优子（跟你同名，不是你；女性）：", text)
+        self.assertEqual(note, "", "备注是空的，这一段只借它的形状")
+
+
+class TestTheJudgeSeesWhoIsWho(unittest.TestCase):
+    """挑行号的那个判断也读同一张表：一行「黛冬优子：…」它也分不清是谁。"""
+
+    def test_the_interjection_judge_is_told_which_name_is_not_hers(self):
+        messages = interests.Interest(None)._messages(
+            [{"card": "黛冬优子", "text": "ふゆ是ふゆ。", "marks": "跟你同名，不是你"}],
+            own=False,
+        )
+        self.assertIn("黛冬优子（跟你同名，不是你）：ふゆ是ふゆ。", messages[1].content)
+
+    def test_the_called_judge_is_told_the_same(self):
+        messages = interests.Interest(None)._called_messages(
+            [{"card": "路加", "text": "ルカだよ", "marks": "另一个 bot，不是人"}],
+            direct=False,
+        )
+        self.assertIn("路加（另一个 bot，不是人）：ルカだよ", messages[1].content)
+
+    def test_an_ordinary_line_is_left_alone(self):
+        messages = interests.Interest(None)._messages(
+            [{"card": "路人乙", "text": "まだ見てない"}], own=False
+        )
+        self.assertIn("路人乙：まだ見てない", messages[1].content)
+
+
+class TestCommandAfterAName(ChannelCase):
+    """「@ふゆ /好感」：字面 @ 不是 at 段，剥掉名字才算命令。
+
+    以前这条两者都不是：`plain_text` 只去掉真的 at 段，字面的「@ふゆ」留在行首，
+    `_accept` 说「不是命令」，整句送判官——问一句心情，被判 level 1，扣两分。
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        path = Path(self.tmp.name) / "characters" / "world" / "test-stage.toml"
+        path.write_text(STAGE_TOML, encoding="utf-8")
+        self.channel.stage = stage_file.load(path)
+
+    def text_seen(self) -> list[str]:
+        seen: list[str] = []
+        original = self.app.turn
+
+        def wrap(*args, **kwargs):
+            seen.append(args[1] if len(args) > 1 else kwargs.get("text", ""))
+            return original(*args, **kwargs)
+
+        self.app.turn = wrap
+        self.addCleanup(setattr, self.app, "turn", original)
+        return seen
+
+    async def test_a_typed_name_before_the_slash_still_runs_it(self):
+        await self.say(event("@ふゆ  /好感", qq="42", message_id="c1", at=""))
+        self.assertTrue(self.client.texts, "命令要回话")
+        self.assertIn("心情", self.client.texts[0])
+        self.assertEqual(self.app.llm.seen, [], "命令不进模型")
+
+    async def test_the_usual_separators_are_stripped_too(self):
+        await self.say(event("ふゆ、/好感", qq="42", message_id="c2", at=""))
+        self.assertIn("心情", self.client.texts[0])
+
+    async def test_a_sentence_that_only_mentions_her_is_not_trimmed(self):
+        """不带斜杠就一个字都不动：她该读到对方的原话，包括那个 @。"""
+        seen = self.text_seen()
+        await self.say(event("@ふゆ 今日は暑いね", qq="42", message_id="c3", at=""))
+        self.assertEqual(seen, ["@ふゆ 今日は暑いね"])
+
+    def test_stripping_is_bounded_to_the_front(self):
+        """只剥句首的称呼，而且调用处还要再看一眼是不是斜杠开头。"""
+        self.assertEqual(self.channel._unaddressed("@ふゆ、/表情 上班"), "/表情 上班")
+        self.assertEqual(self.channel._unaddressed("ふゆはふゆ。"), "はふゆ。")
+
+
+class TestSaidCommand(ChannelCase):
+    """`/我说过`：她在**群里**说过的原话，只有主人、只有私聊。
+
+    有人模仿她的时候，「这句是不是她说的」从外面看不出来：群里那行挂着她的名字，
+    窗口一轮就没了。回执在数据库里，给她一句话拿出来——而且要看的是群里，不是这个私聊：
+    冒充只可能发生在有别人的地方。
+    """
+
+    async def test_the_producer_gets_what_she_said_in_the_room(self):
+        self.enable_private()
+        await self.say(event("ただいま", qq="42", message_id="g1"))
+        await self.say(direct("/我说过", message_id="d1"))
+        said = self.client.texts[-1]
+        self.assertIn("最近在这个群里说过的", said)
+        self.assertIn("早上好", said, "她真的说过的那句")
+        self.assertRegex(said, r"\d{2}-\d{2} \d{2}:\d{2}", "要带时间，不然对不上谁先说的")
+
+    async def test_a_room_number_picks_that_room(self):
+        self.enable_private()
+        await self.say(event("ただいま", qq="42", message_id="g1"))
+        await self.say(direct("/我说过 999", message_id="d1"))
+        self.assertIn("还没在「999」说过什么", self.client.texts[-1], "查的是那个群，不是最近的群")
+
+    async def test_the_private_thread_is_not_what_it_reports(self):
+        """私聊里说过话不算：这条命令回答的是「群里那句是不是她说的」。"""
+        self.enable_private()
+        await self.say(direct("ただいま", message_id="d1"))
+        await self.say(direct("/我说过", message_id="d2"))
+        self.assertIn("还没在", self.client.texts[-1])
+
+    async def test_a_stranger_gets_nothing_at_all(self):
+        self.enable_private()
+        before = len(self.client.texts)
+        await self.say(direct("/我说过", qq="43", message_id="d1"))
+        self.assertEqual(len(self.client.texts), before, "和别的控制指令一样：一声不响")
+
+    async def test_a_group_gets_nothing_even_from_the_producer(self):
+        """群里说一句就等于把料递给模仿的人：只私聊。"""
+        await self.say(event("/我说过", qq="42", message_id="g1"))
+        self.assertEqual(self.client.texts, [])
+
+    async def test_nothing_said_yet_is_said_out_loud(self):
+        self.enable_private()
+        await self.say(direct("/我说过", message_id="d1"))
+        self.assertIn("还没在", self.client.texts[-1])
+
+
+class TestWhatTheJudgeSees(ChannelCase):
+    """判官要读到的那两句背景由通道提供，而不是它自己去猜。"""
+
+    def capture(self) -> list[dict]:
+        facts: list[dict] = []
+        original = self.app.turn
+
+        def wrap(*args, **kwargs):
+            facts.append(dict(kwargs.get("extra_facts") or {}))
+            return original(*args, **kwargs)
+
+        self.app.turn = wrap
+        self.addCleanup(setattr, self.app, "turn", original)
+        return facts
+
+    async def test_a_group_line_arrives_with_the_one_before_it(self):
+        facts = self.capture()
+        await self.say(event("新曲のMV見た？", qq="43", message_id="a", at=""))
+        await self.say(event("まだ見てない", qq="43", message_id="b"))
+        self.assertIn("新曲のMV見た？", facts[-1]["judge.brief"])
+
+    async def test_the_first_private_message_has_no_background(self):
+        self.enable_private()
+        facts = self.capture()
+        await self.say(direct("ただいま", message_id="d1"))
+        self.assertNotIn("judge.brief", facts[-1], "没有前文就什么都不写")
+
+    async def test_a_private_message_arrives_with_the_exchange_before_it(self):
+        self.enable_private()
+        facts = self.capture()
+        await self.say(direct("ただいま", message_id="d1"))
+        await self.say(direct("おかえり", message_id="d2"))
+        brief = facts[-1]["judge.brief"]
+        self.assertIn("ただいま", brief)
+        self.assertIn("早上好", brief, "她上一句也算背景：一问一答才读得懂")
+
+    def test_the_background_is_capped(self):
+        heard = [{"card": "甲", "text": "あ" * 400}]
+        self.assertLessEqual(len(self.channel._brief(heard, "いま", False, "")), 300)
 
 
 class TestInterestedTopics(AmbientCase):
@@ -1524,6 +1953,9 @@ class TestTheNamesSheKnows(AmbientCase):
         class _Low:
             def random(self) -> float:
                 return 0.1
+
+            def randint(self, low: int, high: int) -> int:
+                return low
 
         self.channel._rng = _Low()
         asked = self.judge('{"speak": false, "to": 0}')
@@ -1814,8 +2246,9 @@ class TestSpeakingIntoAQuietRoom(AmbientCase):
         await self.quiet("おつかれ", message_id="a")
         self.hours_ago(6)
         self.channel._rng = Coin(0.0, 0.0, 0.0)
-        # 传进来的是本地时间（`_maybe_idle` 的约定），所以直接写北京的钟点。
-        # 周日 23:30：工作日作息的终点，睡了。休息日的延长见 `TestTheHoursSheKeeps`。
+        # 周日 23:30：休息日，但今晚掷到 0 小时——和平时一样 23:00 就睡了。
+        # 掷到几就熬几小时，见 `TestTheHoursSheKeeps`。
+        self.channel._flag_set("sleep:2026-10-25", "0")
         night = datetime(2026, 10, 25, 23, 30, tzinfo=timezone.utc)
         self.assertFalse(await service._maybe_idle(now=night), "睡觉了不开口")
         morning = datetime(2026, 10, 25, 10, 0, tzinfo=timezone.utc)
@@ -2945,6 +3378,45 @@ class TestHerMemoryFile(unittest.IsolatedAsyncioTestCase):
         self.assertIn("制作人：今日ひま？", asked)
         self.assertTrue(str(path).endswith("group-100.md"))
 
+    async def test_a_stage_direction_is_not_something_a_member_said(self):
+        """她自己开口的那几轮，竖在「用户」位置上的是一句旁白。写进群记忆就成了「有人这样
+        对我说过」，而它其实是系统说的。"""
+        conversation = self.thread("qq:group:100", "路人甲")
+        self.talk(conversation, [
+            "新曲のMV見た？",
+            "まだ見てない",
+            "（没有人叫你。你想说什么就说什么，不必接他们的话。）",
+            "布丁吃不吃",
+        ])
+        path = await self.digest.run(
+            digest_module.GROUP, "100", heading="群里的记忆", days=7, now=self.NOW
+        )
+        self.assertIsNotNone(path)
+        asked = self.llm.asked()
+        self.assertNotIn("没有人叫你", asked, "旁白不是谁说的话")
+        self.assertIn("路人甲：布丁吃不吃", asked, "别把正常的括号话一起删掉")
+        self.assertIn("ふゆ：", asked, "她自己说过的还在")
+
+    async def test_a_member_who_took_her_name_is_not_her_in_the_memory(self):
+        """记忆文件里 `冬優子：…` 和她自己那行长得一模一样。一周一次的重写会把这个错写稳：
+        之后她「记得」自己说过某句，其实是别人顶着她的名字说的。"""
+        conversation = self.thread("qq:group:100", "黛冬优子")
+        self.talk(conversation, ["ふゆ是ふゆ。", "这句是我说的"])
+        other = self.thread("qq:group:100", "路人乙")
+        self.talk(other, ["まだ見てない", "そうだね"])
+        named = digest_module.Digest(
+            self.store, self.llm, self.root, clock=lambda: self.NOW,
+            self_name="ふゆ", her_names=("ふゆ", "黛冬优子"),
+        )
+        path = await named.run(
+            digest_module.GROUP, "100", heading="群里的记忆", days=7, now=self.NOW
+        )
+        self.assertIsNotNone(path)
+        asked = self.llm.asked()
+        self.assertIn("黛冬优子（另一个人，只是同名）：ふゆ是ふゆ。", asked)
+        self.assertIn("路人乙：まだ見てない", asked, "别人不加这个")
+        self.assertNotIn("黛冬优子：ふゆ是ふゆ。", asked, "裸的名字会读成她自己")
+
     async def test_the_group_cadence_is_a_week(self):
         self.dm_group = None
         conversation = self.thread("qq:group:100", "路人甲")
@@ -3113,7 +3585,9 @@ class TestHerMemoryInTheTurn(ChannelCase):
         )
 
     def put(self, kind: str, key: str, body: str) -> None:
-        folder = Path(self.tmp.name) / "characters" / "memory"
+        # 记忆按角色分目录：`characters/memory/<id>/<kind>-<key>.md`。共用一个 `memory/`
+        # 意味着换角色时下一个人会读到上一位的经历，那是这次改造要消掉的东西。
+        folder = Path(self.tmp.name) / "characters" / "memory" / "test"
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"{kind}-{key}.md").write_text(f"# 记忆\n\n{body}\n", encoding="utf-8")
 
@@ -3131,6 +3605,12 @@ class TestHerMemoryInTheTurn(ChannelCase):
 
     def text_of(self, sections) -> str:
         return "\n".join(section.text for section in sections)
+
+    def test_the_memory_belongs_to_the_character_not_the_room(self):
+        """`memory/<id>/…`：换角色时下一个人不能把上一位的经历当成自己的。"""
+        path = self.channel.digest.path("group", "100")
+        self.assertEqual(path.parent.name, "test", "角色 id 在路径里")
+        self.assertEqual(path.parent.parent.name, "memory")
 
     async def test_the_private_chat_reads_the_private_memory(self):
         self.put("dm", "42", "- 他说过想一起住")
@@ -4808,29 +5288,102 @@ class TestTheHoursSheKeeps(AmbientCase):
         when = self.local(*args).astimezone(timezone.utc)
         self.channel._clock = lambda: when
 
-    def test_a_workday_night_is_asleep(self):
-        self.config()
-        self.assertTrue(self.channel.resting(self.local(2026, 10, 30, 23, 30)), "周五 23:30")
-        self.assertTrue(self.channel.resting(self.local(2026, 10, 30, 8, 59)), "周五早上 8:59")
-        self.assertFalse(self.channel.resting(self.local(2026, 10, 30, 22, 30)))
-        self.assertFalse(self.channel.resting(self.local(2026, 10, 30, 9, 0)))
+    def dice(self, day: str, hours: int) -> None:
+        """替她掷好的那一夜：直接写进 `qq_flags`，免得测试依赖随机数。"""
+        self.channel._flag_set(f"sleep:{day}", str(hours))
 
-    def test_a_day_off_stays_up_until_two(self):
+    def test_a_workday_night_is_asleep(self):
+        """周三晚上（明天周四要上班）23:00 睡。——周五晚上不再是这种晚上，见下一条。"""
         self.config()
-        self.assertFalse(self.channel.resting(self.local(2026, 10, 31, 1, 0)), "周六 1 点还醒着")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 28, 23, 30)), "周三 23:30")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 28, 8, 59)), "周三早上 8:59")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 28, 22, 30)))
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 28, 9, 0)))
+
+    def test_the_night_before_a_day_off_is_hers_to_stay_up(self):
+        """周五晚上不看「今天是不是休息日」，看「明天用不用上班」。"""
+        self.config()
+        self.dice("2026-10-30", 2)  # 周五 23:00 + 2 → 周六 01:00 上床
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 30, 23, 30)), "周五晚上不睡")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 31, 0, 59)))
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 31, 1, 30)), "熬完就睡了")
+
+    def test_the_night_before_work_is_not(self):
+        """周日晚上不熬：周一要上班。问的是明天，不是今天（今天确实是休息日）。"""
+        self.config()
+        self.assertTrue(self.channel.resting(self.local(2026, 11, 1, 23, 30)), "周日 23:30 睡了")
+
+    def test_a_day_off_stays_up_as_long_as_the_dice_say(self):
+        """不是「固定熬到两点」，是「掷到几就熬几个小时」。"""
+        self.config()
+        self.dice("2026-10-30", 3)  # 周五 23:00 + 3 → 周六 02:00 上床
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 31, 1, 0)), "1 点还醒着")
         self.assertFalse(self.channel.resting(self.local(2026, 10, 31, 1, 59)))
-        self.assertTrue(self.channel.resting(self.local(2026, 10, 31, 2, 30)))
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 31, 2, 30)), "2 点后睡了")
+
+    def test_the_dice_never_pushes_her_past_three(self):
+        """最晚 +4 小时 = 凌晨 3 点。掷到 4 也不是「随缘通宵」。"""
+        self.config()
+        self.dice("2026-10-30", 4)
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 31, 2, 59)))
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 31, 3, 1)))
+
+    def test_a_sleep_that_crosses_midnight_belongs_to_the_evening(self):
+        """周三 23:00 睡下，周四 0:30 不能又「醒」——那一觉是周三晚上的。
+
+        旧写法按「今天」判断：日历一翻页就换一套作息，于是 0:00 一过她就复活了。人的一夜
+        不会因为日历翻页而中断。
+        """
+        self.config()
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 28, 23, 30)))
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 0, 30)), "还在那一觉里")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 8, 59)))
+
+    def test_the_roll_is_made_once_and_kept(self):
+        """同一夜两次问，答案必须一样：不存库的话，她会在 0:30 醒、0:40 又睡。"""
+        self.config()
+        self.channel._rng = Coin(3)  # 第一次掷到 3
+        first = self.channel._late_hours(date(2026, 10, 31))
+        self.channel._rng = Coin(0.0)  # 就算骰子换了，也不该再掷
+        second = self.channel._late_hours(date(2026, 10, 31))
+        self.assertEqual((first, second), (3, 3))
+        self.assertEqual(self.channel._flag("sleep:2026-10-31"), "3")
+
+    def test_a_database_that_cannot_take_the_roll_does_not_reroll(self):
+        """库写不进去（表没建、盘满）时，这一夜也得是同一个数。
+
+        只有数据库那一份的话，一次写失败 = 每轮重掷，她会在 0:30 醒、0:40 又睡——
+        比不随机更像坏掉。所以内存里先记一遍。
+        """
+        self.config()
+        broken = self.channel.app.store
+
+        class Dead:
+            def query(self, *a, **k):
+                return []
+
+            def execute(self, *a, **k):
+                raise RuntimeError("disk is full")
+
+        self.channel.app.store = Dead()
+        self.channel._rng = Coin(3)
+        first = self.channel._late_hours(date(2026, 10, 30))
+        self.channel._rng = Coin(0.0)  # 骰子换了，也不该再掷
+        second = self.channel._late_hours(date(2026, 10, 30))
+        self.channel.app.store = broken
+        self.assertEqual((first, second), (3, 3))
 
     def test_a_listed_holiday_is_a_day_off_and_a_listed_saturday_is_not(self):
         self.config()
-        # 2026-10-01 是周四，但写在 QQ_HOLIDAYS 里 → 按休息日（凌晨一点还醒着）。
+        self.dice("2026-09-30", 3)
+        # 2026-10-01 是周四，但写在 QQ_HOLIDAYS 里 → 前一晚（09-30）就熬，凌晨一点还醒着。
         self.assertFalse(self.channel.resting(self.local(2026, 10, 1, 1, 30)))
-        # 2026-10-03 是周六，但写在 QQ_WORKDAYS 里（调休）→ 按工作日。
+        # 2026-10-03 是周六，但写在 QQ_WORKDAYS 里（调休上班）→ 前一晚不熬，凌晨一点睡了。
         self.assertTrue(self.channel.resting(self.local(2026, 10, 3, 1, 30)))
 
     async def test_she_does_not_join_a_room_after_her_bedtime(self):
         self.config()
-        self.at(2026, 10, 30, 23, 30)
+        self.at(2026, 10, 28, 23, 30)  # 周三：明天要上班
         await self.quiet("まだ起きてる", message_id="a")
         await self.quiet("眠れない", message_id="b")
         self.assertEqual(self.client.texts, [])
@@ -4838,7 +5391,7 @@ class TestTheHoursSheKeeps(AmbientCase):
 
     async def test_a_call_at_night_is_answered_in_the_woken_up_voice(self):
         self.config()
-        self.at(2026, 10, 30, 23, 40)
+        self.at(2026, 10, 28, 23, 40)  # 周三：明天要上班，这时她确实睡了
         # 好感是插件里的数，这里只关心语气，所以直接给一个「亲近」的值。
         self.channel._affinity = lambda *a, **k: 80.0
         seen: dict = {}
@@ -4895,7 +5448,8 @@ class TestTheWokenThread(AmbientCase):
         base.update(overrides)
         self.channel.config = QQConfig(**base)
 
-    def night(self, hour: int = 23, minute: int = 40, day: int = 30) -> None:
+    def night(self, hour: int = 23, minute: int = 40, day: int = 28) -> None:
+        """默认是周三 23:40 —— 明天周四要上班，所以这时她确实睡了。"""
         when = datetime(2026, 10, day, hour, minute, tzinfo=self.JST).astimezone(timezone.utc)
         self.channel._clock = lambda: when
 
@@ -4960,8 +5514,9 @@ class TestTheWokenThread(AmbientCase):
         self.assertEqual(len(self.client.texts), before, "这一觉结束了")
 
         # 第二天晚上同一觉之外：账本按「醒来的那天」编号，所以重新开始。
+        # 29 号周四，明天周五也要上班：还是 23:00 睡，不用掷骰子。
         self.channel._rng = Coin(0.5)
-        self.night(day=31)
+        self.night(day=29)
         await self.say(event("こんばんは", qq="43", message_id="a3"))
         self.assertGreater(len(self.client.texts), before, "新的一觉照常")
 

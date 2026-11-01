@@ -20,6 +20,8 @@ from pathlib import Path
 
 from core.plugin import Plugin, Route
 
+from . import packs as pack_file
+
 SHEETS = "sheets"
 FALLBACK_COLOR = "#8ab4f8"
 
@@ -136,6 +138,28 @@ class Characters(Plugin):
         self._by_id = {character.id: character for character in self._all}
         self._paths = _sheet_paths(self._root, self._config)
         self._stamp = self._signature()
+        # 两条线：作品（共享，一份）与角色包（每人一份）。包只是路径，读不读由用的人决定。
+        self.work = pack_file.load_work(self._root)
+        self._packs = {
+            character.id: pack_file.Pack(self._root, character.id, self.work)
+            for character in self._all
+        }
+        self._adopt_packs()
+
+    def _adopt_packs(self) -> None:
+        """A `packs/<id>/persona.md` wins over `sheets/<id>.md`, and nothing else changes.
+
+        Only the sheet is taken here: the roster is read before the packs exist, and a
+        character whose persona lives in the new place must not be loaded as 「（这个人设还
+        没有写。）」 just because the old path is empty."""
+        from dataclasses import replace
+
+        adopted = tuple(
+            replace(character, sheet=self._packs[character.id].text("persona") or character.sheet)
+            for character in self._all
+        )
+        self._all = adopted
+        self._by_id = {character.id: character for character in adopted}
 
     # ---- keeping up with edits on disk
 
@@ -160,6 +184,11 @@ class Characters(Plugin):
         self._by_id = {character.id: character for character in found}
         self._paths = _sheet_paths(self._root, self._config)
         self._stamp = self._signature()
+        self.work = pack_file.load_work(self._root)
+        self._packs = {
+            character.id: pack_file.Pack(self._root, character.id, self.work)
+            for character in found
+        }
         return True
 
     def _signature(self) -> tuple:
@@ -202,25 +231,59 @@ class Characters(Plugin):
         character = self._by_id.get(character_id)
         return character.name if character else None
 
+    def pack(self, character_id: str) -> pack_file.Pack:
+        """One character's map of files. Unknown ids get an empty map rather than a raise:
+        a memory left behind by a character who is no longer here is still shown on the
+        page, and it should read as 「no files」, not as an error."""
+        found = self._packs.get(character_id)
+        if found is None:
+            return pack_file.Pack(self._root, character_id, self.work)
+        return found
+
+    def card_tails(self, character_id: str) -> tuple[str, ...]:
+        """What to strip off the end of a card title — her name, in the spellings her pack
+        says. Empty when nothing is known: never somebody else's name."""
+        character = self._by_id.get(character_id)
+        if character is None:
+            return ()
+        return pack_file.card_tails(character, self.pack(character_id))
+
+    def tell(self, character: Character) -> dict[str, object]:
+        """One character, as the page sees them: the roster fields plus where her files came
+        from. The page shows the second half in the character sheet — 「这份人设读的是哪个
+        文件、还有什么是旧的」 is the first question when a character sounds off."""
+        return {**character.brief(), "pack": self.pack(character.id).compact()}
+
     def capabilities(self) -> dict[str, object]:
         return {
             "count": len(self._all),
             "default": self._all[0].id,
             "colors": True,
+            "work": self.work.as_dict(),
         }
 
     def routes(self) -> dict[tuple[str, str], Route]:
         async def characters(query, body):  # noqa: ANN001 - the shape is in plugin.Route
-            return {"characters": [character.brief() for character in self._all]}
+            return {
+                "characters": [self.tell(character) for character in self._all],
+                "work": self.work.as_dict(),
+            }
 
         async def character(query, body):  # noqa: ANN001
             try:
                 found = self.character(_q(query, "c") or None)
             except KeyError:
                 return {"error": "没有这个角色"}
-            return found.brief()
+            return {**self.tell(found), "files": self.pack(found.id).summary()}
 
-        return {("GET", "/api/characters"): characters, ("GET", "/api/character"): character}
+        async def work(query, body):  # noqa: ANN001
+            return self.work.as_dict()
+
+        return {
+            ("GET", "/api/characters"): characters,
+            ("GET", "/api/character"): character,
+            ("GET", "/api/work"): work,
+        }
 
 
 def _q(query, name: str) -> str:  # noqa: ANN001 - a flat dict of first values

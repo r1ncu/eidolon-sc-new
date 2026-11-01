@@ -154,8 +154,21 @@ class Memory(Plugin):
         recall: int = RECALL,
         clock: Callable[[], datetime] | None = None,
         timezone_name: str = "Asia/Shanghai",
+        work: object | None = None,
     ) -> None:
         self._store = store
+        # 记忆抽取的提示里原本写死《偶像大师 闪耀色彩》283 事务所。这是「作品」的事，
+        # 不归任何一个角色：从 `work.toml` 来，没有就退成中性措辞。
+        name = getattr(work, "name", None)
+        house = getattr(work, "house", None)
+        title = name() if callable(name) else ""
+        agency = house() if callable(house) else ""
+        if title and agency:
+            self._instructions = _INSTRUCTIONS.replace("{where}", f"{title}{agency}的偶像们")
+        elif title:
+            self._instructions = _INSTRUCTIONS.replace("{where}", f"{title}的偶像们")
+        else:
+            self._instructions = _INSTRUCTIONS.replace("{where}", "一位角色")
         self._llm = llm
         self._names = names or (lambda character_id: None)
         self._recall = recall
@@ -281,7 +294,7 @@ class Memory(Plugin):
             else:
                 lines.append(f"{name}：{_said(message)}")
         lines += [f"制作人（最新的一句话）：{text}", f"{name}：{_said(reply)}"]
-        return [ChatMessage("system", _INSTRUCTIONS), ChatMessage("user", "\n".join(lines))]
+        return [ChatMessage("system", self._instructions), ChatMessage("user", "\n".join(lines))]
 
     def add(
         self,
@@ -500,7 +513,7 @@ class Memory(Plugin):
 
 
 _INSTRUCTIONS = """\
-你负责替《偶像大师 闪耀色彩》283 事务所的偶像们记住关于制作人的事。制作人就是正在和偶像对话的用户。
+你负责替{where}记住关于制作人的事。制作人就是正在和角色对话的用户。
 读下面的对话，从制作人最新的一句话里找出值得长期记住的、关于制作人本人的信息。
 
 只记过后仍有意义的事。

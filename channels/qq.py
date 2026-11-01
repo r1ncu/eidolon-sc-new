@@ -52,7 +52,7 @@ import urllib.request
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +62,7 @@ from core.prompt import Section, Slot
 from core.protocol.reply import PhotoTagged, unquote
 from plugins.affinity import label as tier_label, tier_of
 
+from . import calendar as calendar_file
 from . import outbox as box
 from . import romance
 from . import stage as stage_file
@@ -118,9 +119,16 @@ Kept for the private-chat ping (which is a different thing from a room) — the 
 REST_HOURS = (23, 9)
 """Workday sleep, local time: 23:00 → 09:00."""
 
-HOLIDAY_REST_HOURS = (2, 9)
-"""The same on a day off: she stays up to two, like a person who does not have work tomorrow.
-Night is longer than a workday's by three hours, which is the whole point of a holiday."""
+MAX_LATE_HOURS = 4
+"""最多熬多久：四小时，也就是最晚到凌晨三点。
+
+**熬夜看的是明天，不是今天**：第二天的日历上没有安排（周末、祝日、`QQ_HOLIDAYS`），
+今晚 23:00 她就掷一次骰子，掷到几就熬几个小时。周五晚上熬夜是因为周六不上班，不是因为
+周五本身是休息日——反过来，周日晚上不熬，因为周一要上班。
+
+日历按这张部署的表算（`characters/calendar.toml`，日本的祝日 + 周末），不是按跑代码那台
+机器的。骰子**一夜一次，存库**（`qq_flags.sleep:<上床那天的日期>`）：不存的话每轮都会
+重掷，她会在 0:30 和 0:40 之间反复睡着又醒来。"""
 
 NIGHT_NOTE = """【这个点你已经睡了】现在是 {when}。你早就躺下、已经睡着了，这一条把你吵醒了。
 {how}
@@ -187,6 +195,14 @@ LANG_NOTE = """【这个号只看中文】QQ 里对方能看到的**只有 `<zh>
 QQ 里就是一句日语，或者干脆一句话都没有。格式指令说的是「日语 + 中文字幕」，两条都写在
 一起，靠它自己分清哪个是给对方看的，偶尔会分错。
 """
+
+SELF_LINE = "你自己（刚说的）"
+"""How her own line is named in the room's little window.
+
+Not her name. 「黛冬优子：……」 is exactly what a member who renamed themselves after her
+looks like in the same transcript, and telling those two apart is the difference between
+「我什么时候说过」 and 「这句是我说的」. So her own words say so in the label itself: the
+prefix is a fact about the line, and the model does not have to infer it from context."""
 
 FACE_NOTE = """【表情】消息里的 `[表情]`、`[表情 名字]`、`[动画表情]` 是 QQ 的表情，不是文字：那是他按了一个表情，你看不到那张图，只知道他发了。当成语气来读——笑、无语、附和、撒娇，都可能。整条只有表情的时候，就是他没有说话、只给了你一个表情：接住它，说一句短的，不要问「这是什么意思」，也不要把 `[表情]` 当成他说的话照念。
 """
@@ -341,50 +357,60 @@ class QQChannel:
         self.log = log or (lambda line: None)
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         self.identities = identities or Identities(app.store, now=now)
+        # 这个人的文件在哪：`packs/<id>/` 优先，旧的扁平 `world/<id>-*.md` 兜底（见
+        # `plugins/packs.py`）。解析一次、往里都是 Path 或 None——不能在这里拼文件名，
+        # 否则「换一个角色」就又变成改代码。
+        self.files = app.characters.pack(config.character) if config.character else None
+        files = self.files
+        # 日历：周末 + 日本祝日（`characters/calendar.toml`），`.env` 的两个覆盖优先。
+        # 作息要回答「今天要不要早起」，这个问题的答案在一个国家里，不在这台机器里。
+        # 只装日历本身；`.env` 的两个覆盖在 `_off` 里**每次现读**，因为 `config` 是可以在
+        # 运行时被替换的（测试就是这么做的，而且换一个部署不该要求重建通道）。
+        self.calendar = calendar_file.load(
+            app.settings.characters,
+            timezone=app.settings.timezone,
+        )
+
+        def own(kind: str) -> Path | None:
+            return files.path(kind) if files is not None else None
+
         self.world = world or World(
             app.settings.characters,
             config=app.settings.characters_config,
             meta=config.meta,
+            work=getattr(app.characters, "work", None),
+            pack=getattr(app.characters, "pack", None),
         )
-        self.stage_path = (
-            world_path(app.settings.characters, f"{config.character}-stage.toml")
-            if config.character
-            else None
-        )
+        self.stage_path = own("stage")
         # 「她怎么称呼自己、怎么称呼对面」——这几个字出现在记忆文件、日志和命令回复里，
         # 每一处都写死就成了别人的角色。一次读进来，往下都用它。
         self.stage = stage_file.load(self.stage_path)
         self.owner_name = self.stage.get("names.owner", "") or "对方"
         self.presence = presence or Presence(
-            world_path(app.settings.characters, f"{config.character}-qq.md"),
-            direct=world_path(app.settings.characters, f"{config.character}-dm.md"),
+            own("qq"),
+            direct=own("dm"),
             stage=self.stage,
         )
         self.outbox = outbox or box.Outbox(app.store, client.call, log=self.log)
         self.pack = stickers
         # Refusals are words, so they are the character's and not the module's: a deployment
         # that wrote `<id>-refusals.toml` gets its own, everyone else gets the plain fallback.
-        self.refusals = refusals if refusals is not None else texts.load(
-            world_path(app.settings.characters, f"{config.character}-refusals.toml")
-            if config.character
-            else None
-        )
+        self.refusals = refusals if refusals is not None else texts.load(own("refusals"))
         # 「她感兴趣的话题」不是配置，是人设的一部分，所以这是一份角色文件而不是一个
         # 环境变量：换一个角色，她该接的话头也跟着换。没有这个文件时用中性默认。
         self.interest = Interest(
             app.llm,
-            world_path(app.settings.characters, f"{config.character}-interests.md")
-            if config.character
-            else None,
+            own("interests"),
             name=_character_name(app, config.character),
             log=self.log,
             # 「她认识谁」也是角色的东西：换一位角色，她熟的同行就换了。没有这份表时
             # 谁都认不出来，插话判断跟以前一模一样。
-            idols=world_path(app.settings.characters, f"{config.character}-idols.toml")
-            if config.character
-            else None,
+            idols=own("relations"),
         )
         self._rng = rng or random.Random()
+        self._sleep_memo: dict[str, int] = {}
+        """今晚掷到几，先记在这里再落库。库写不进去（表没建、盘满）时，至少这一夜还是同一个
+        数：只有数据库那一份的话，一次写失败就等于每轮重掷，她会在 0:30 醒、0:40 又睡。"""
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.digest = Digest(
             app.store,
@@ -395,6 +421,9 @@ class QQChannel:
             timezone_name=app.settings.timezone,
             self_name=self.stage.get("names.self", ""),
             owner_name=self.stage.get("names.owner", ""),
+            character_id=self.config.character,
+            # 名片跟她同名的人，写进记忆时要标出来：`冬優子：…` 和她自己那行长得一样。
+            her_names=stage_file.names(self.stage, "names.mentions"),
         )
         self._heard: dict[str, deque] = {}
         self._last_ambient: dict[str, float] = {}
@@ -464,7 +493,7 @@ class QQChannel:
         # or may not join, and an @ is answered on the spot, unheard-of-anything-else,
         # exactly as this channel worked before the switch existed.
         called = ""
-        if self.config.called and (mentioned or self._named(text)):
+        if self.config.called and (mentioned or self._named(text, qq_id, card)):
             called = "at" if mentioned else "name"
         elif not mentioned:
             self._remember(group, qq_id, card, text)
@@ -539,7 +568,64 @@ class QQChannel:
         if not text:
             return
         lines = self._heard.setdefault(group, deque(maxlen=max(2, self.config.ambient_heard)))
-        lines.append({"qq": qq_id, "card": card, "text": text})
+        row = {"qq": qq_id, "card": card, "text": text}
+        marks = self._marks(qq_id, card)
+        if marks:
+            # 只给「读给人看的那一处」用。`card` 保持干净：它会被交给 `_turn`，再写进
+            # `qq_identities.group_card`——标签混进去就是把备注写成了名字。
+            row["marks"] = marks
+        lines.append(row)
+
+    def _marks(self, qq_id: str, card: str) -> str:
+        """What the line's speaker has to be called besides their name, if anything.
+
+        Two facts belong here, and both of them are about 「这句是不是我说的」:
+
+        - **跟你同名，不是你** —— 群里有人把名片改成她自己的名字（同好、cos、或者另一个
+          冬优子 bot）。窗口里那行于是就叫「黛冬优子：…」，和她自己一模一样；只靠语义去分，
+          分错的代价是「那句，ふゆ刚说过」。
+        - **另一个 bot，不是人** —— `QQ_BOTS` 里登记过的号，是另一个角色在说话。旁听（ambient）
+          那条路以前不告诉她这件事，一段别家 bot 的台词就被当成陌生群友的寒暄来接。
+        """
+        name = (card or "").strip()
+        if not name:
+            return ""
+        marks: list[str] = []
+        if self.config.bot_of(qq_id):
+            # 只写「是 bot」，不写是哪个角色的：名片「路加」已经在名字里了，再嵌一层括号
+            # 只会让这一行难读（「路加（另一个 bot（luca），不是人）」）。
+            marks.append("另一个 bot，不是人")
+        if any(one and one in name for one in stage_file.names(self.stage, "names.mentions")):
+            marks.append("跟你同名，不是你")
+        return "；".join(marks)
+
+    def _remember_self(self, group: str, text: str) -> None:
+        """Her own line, kept in the same window as everybody else's.
+
+        This window used to hold only what *other* people said. Two things followed from
+        that, and both looked like a character bug rather than a bookkeeping one:
+
+        - somebody answers her interjection without @-ing her, and the answer arrives with
+          nothing in front of it — she reads it as a sentence out of nowhere, and invents
+          the rest;
+        - she cannot tell 「我刚才说过」 from 「我没说过」, because the only place her own
+          words ever appeared was her own thread — and a room is many threads.
+
+        So her line travels here too, marked `self`. `_lines` labels it, `Interest` never
+        picks it as something to answer, and `_interject` does not count it as «somebody
+        else said something»."""
+        said = (text or "").strip()
+        if not said:
+            return
+        lines = self._heard.setdefault(group, deque(maxlen=max(2, self.config.ambient_heard)))
+        lines.append(
+            {
+                "qq": str(self.config.self_id),
+                "card": SELF_LINE,
+                "text": said,
+                "self": True,
+            }
+        )
 
     async def _interject(self, group: str, qq_id: str, card: str) -> None:
         """Decide whether to say something nobody asked for, and about what.
@@ -580,20 +666,23 @@ class QQChannel:
         own = bool(self.config.ambient_own_p) and (
             self._rng.random() < float(self.config.ambient_own_p)
         )
+        # 她自己说过的话也在这张窗口里（`_remember_self`），但它不是「有人在说话」：
+        # 一轮接话至少要有一个别人的「话头」，否则她就是在回答自己。
+        others = [line for line in lines if not line.get("self")]
         # A reply needs somebody else's line to answer; a thought of her own only needs the
         # room to be alive at all.
-        if len(lines) < (1 if own else 2):
+        if len(others) < (1 if own else 2):
             return
         heard = list(lines)
         # 一张「无语」的表情不用先决定「她有没有话说」——先问这个，问完这一轮就不用再问了。
         # 放在 `ambient_p` 之前：插话的骰子管的是「说不说话」，这张管的是「说不出话」。
-        if await self._maybe_face(group, heard):
+        if await self._maybe_face(group, others):
             self._last_checked[group] = now
             return
         # 「关系越密切越可能接话」：话里出现了她认识的同行时，看这一眼的概率按亲疏抬高。
         # 是概率不是开关——gap 和每日次数照旧管着，所以整体还是低频，不会变成听见名字就开口。
         chance = float(self.config.ambient_p)
-        mention = self.interest.mention(heard)
+        mention = self.interest.mention(others)
         if mention is not None and chance < 1.0:
             chance = min(
                 1.0, chance + (1.0 - chance) * (mention.closeness / 3.0) * IDOL_LEAN
@@ -611,7 +700,15 @@ class QQChannel:
             # asked most often, and a silent `return` makes it unanswerable from the log.
             self.log(f"qq: 看了一眼群里，没接（{why or '没什么可接的'}）")
             return
-        target = heard[min(max(1, which), len(heard)) - 1]
+        index = min(max(1, which), len(heard)) - 1
+        target = heard[index]
+        if target.get("self"):
+            # 她回自己。模型挑行号时看不见「这句是我说的」，所以这里替它改：换成她这一句
+            # 之前最近的一句别人的话；没有就这一轮不开口。
+            earlier = [line for line in heard[:index] if not line.get("self")]
+            if not earlier:
+                return
+            target = earlier[-1]
         said = (target.get("text") or "").strip()
         if not said or said.startswith(("/", "／")):
             return
@@ -712,21 +809,107 @@ class QQChannel:
     def resting(self, now: datetime | None = None) -> bool:
         """Whether this is an hour she would not be awake for.
 
-        Two schedules, because a person has two: a workday ends at eleven, a day off does
-        not. Weekends count as days off; `QQ_HOLIDAYS` / `QQ_WORKDAYS` override the calendar
-        for the days it disagrees with itself (国庆、调休上班的周六).
+        One sleep, not one rule: it starts when she went to bed and ends at nine the next
+        morning. **What is on tomorrow** decides when it started — 23:00 when the next day is
+        a workday, or 23:00 plus the hours she rolled when it is not (see `MAX_LATE_HOURS`).
+
+        The reason it is written this way instead of 「现在是不是在 23–9 之间」: a sleep that
+        crosses midnight belongs to the evening it started. The old check looked at
+        *today's* date, so on a Friday she went to bed at 23:00, the calendar turned into
+        Saturday (a day off), and she was awake again at 00:00 — one hour of sleep in the
+        middle of a night. Attributing the sleep to the evening fixes that without a special
+        case: 凌晨 0:30 属于昨晚那一觉，而昨晚要不要早睡，昨晚已经决定了。
 
         Only answers one question — 「主动开口要不要闭嘴」。有人叫她就照回，只是语气不一样
         （见 `_night_note`）：一条 @ 在凌晨被吞掉，比被吵醒更像坏掉。
         """
         local = _local_time(now or self._clock(), self.app.settings.timezone)
-        day = local.strftime("%Y-%m-%d")
-        off = day in self.config.holidays or (
-            local.weekday() >= 5 and day not in self.config.workdays
+        # 9 点前还属于昨晚那一觉；9 点之后这一觉属于今天。
+        evening = local.date() if local.hour >= REST_HOURS[1] else local.date() - timedelta(days=1)
+        start = self._sleep_at(evening)
+        wake = datetime.combine(
+            evening + timedelta(days=1), time(REST_HOURS[1], 0), tzinfo=start.tzinfo
         )
-        start, end = HOLIDAY_REST_HOURS if off else REST_HOURS
-        hour = local.hour
-        return (hour >= start or hour < end) if start > end else (start <= hour < end)
+        return start <= local < wake
+
+    # ---- 今晚几点睡
+
+    def _zone(self) -> Any:
+        return _zone(self.app.settings.timezone)
+
+    def _off(self, day: date) -> bool:
+        """这一天算不算休息日：`.env` 的两个覆盖优先，然后是祝日，最后是周末。"""
+        if day.isoformat() in self.config.workdays:
+            return False
+        if day.isoformat() in self.config.holidays:
+            return True
+        return self.calendar.is_off(day)
+
+    def _sleep_at(self, evening: date) -> datetime:
+        """那天晚上她几点上床：第二天的日历说了算。
+
+        明天要早起（工作日）→ 23:00 就睡；明天没有安排（周末、祝日、调休放假）→ 掷一次
+        骰子，熬 0–`MAX_LATE_HOURS` 小时。问的是 `evening + 1 day`，不是 `evening`：
+        「今晚能不能熬」取决于明天要不要上班，而不是今天上没上过班——周五晚上一样是熬夜的
+        晚上，周日晚上不是。
+        """
+        start = datetime.combine(evening, time(REST_HOURS[0], 0), tzinfo=self._zone())
+        if not self._off(evening + timedelta(days=1)):
+            return start
+        return start + timedelta(hours=self._late_hours(evening))
+
+    def _late_hours(self, evening: date) -> int:
+        """她今晚熬几个小时：掷一次，**存进 `qq_flags`**，这一夜都用这个数。
+
+        不存的话，`resting()` 每轮都会掷一次骰子：同一个人 0:30 叫她是醒的、0:40 再叫
+        就睡了，比不随机更像坏掉。键按「上床那天」记：`sleep:2026-10-31`。
+        """
+        key = f"sleep:{evening.isoformat()}"
+        memo = self.__dict__.setdefault("_sleep_memo", {})
+        if key in memo:
+            return memo[key]
+        stored = self._flag(key)
+        if stored is not None:
+            try:
+                hours = max(0, min(MAX_LATE_HOURS, int(stored)))
+                memo[key] = hours
+                return hours
+            except (TypeError, ValueError):
+                pass
+        try:
+            hours = self._rng.randint(0, MAX_LATE_HOURS)
+        except Exception:  # 一个不认识的随机源不该把作息连同消息处理一起弄坏
+            hours = 0
+        memo[key] = hours
+        self._flag_set(key, str(hours))
+        tomorrow = (evening + timedelta(days=1)).isoformat()
+        clock = (REST_HOURS[0] + hours) % 24
+        when = f"{clock:02d}:00" + ("（次日）" if hours else "")
+        self.log(
+            f"qq: 明天 {tomorrow} 不上班"
+            f"（{self.calendar.name(evening + timedelta(days=1)) or '休み'}），"
+            f"今晚熬 {hours} 小时，{when} 睡"
+        )
+        return hours
+
+    def _flag(self, key: str) -> str | None:
+        try:
+            rows = self.app.store.query("SELECT value FROM qq_flags WHERE key = ?", (key,))
+        except Exception:  # 没有那张表（channel 单独跑）也得能说话
+            return None
+        return str(rows[0]["value"]) if rows else None
+
+    def _flag_set(self, key: str, value: str) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            self.app.store.execute(
+                "INSERT INTO qq_flags (key, value, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value,"
+                " updated_at = excluded.updated_at",
+                (key, value, now),
+            )
+        except Exception as exc:
+            self.log(f"qq: 记不下 {key}（{type(exc).__name__}）")
 
     def _night_note(self, value: float, turn: int = 0, ends: int = 0) -> str:
         """The line that goes into the prompt when a reply has just woken her up.
@@ -968,16 +1151,110 @@ class QQChannel:
     def _ours(self, qq_id: str) -> bool:
         return bool(qq_id) and qq_id != str(self.config.self_id) and qq_id not in self.config.ignore
 
-    def _named(self, text: str) -> bool:
+    def _unaddressed(self, text: str) -> str:
+        """The sentence with the name it was addressed to taken off the front.
+
+        Two ways to address her produce a line that starts with something other than a
+        slash: a real at (already gone by the time the text arrives) and a *typed* 「@ふゆ」,
+        which is just characters. Somebody typing 「@ふゆ /好感」 means the command; the
+        channel used to read it as conversation and send it to the judge.
+
+        Only names from `names.mentions` are stripped, repeatedly and with the usual
+        separators, because 「@ふゆ、/表情 上班」 is the same sentence with a comma. The
+        caller uses the result only when a slash follows, so this can be generous.
+        """
+        names = sorted(
+            (one for one in stage_file.names(self.stage, "names.mentions") if one),
+            key=len,
+            reverse=True,
+        )
+        said = (text or "").lstrip(" \u3000")
+        while True:
+            before = said
+            said = said.lstrip(" \u3000@＠")
+            for name in names:
+                if said.startswith(name):
+                    said = said[len(name):]
+                    break
+            if said == before:
+                break
+        return said.lstrip(" \u3000,，、:：")
+
+    def _brief(self, heard: Any, text: str, private: bool, conversation_id: str) -> str:
+        """The two lines before the one being judged, as background for the judge.
+
+        It reads one sentence, and one sentence is often not enough to tell 「敷衍」 from
+        「短」. A bare 「好感」 was judged level 0 — hurt her — and cost the speaker five
+        points; with the question in front of it in view there is nothing to misread.
+
+        A group has the window (`heard`), and the line before this one is the two entries
+        ahead of it — **including her own**, labelled 「你自己（刚说的）」: 「そうだね」 answers
+        her, and a judge that cannot see what it answers reads it as a non-sequitur. A
+        private chat has no window but it has history, so the last two messages of the
+        thread are the same thing. Capped at 300 characters: past that the judge starts
+        answering the background instead of the sentence.
+        """
+        if private:
+            rows = self.app.store.query(
+                "SELECT role, text, segments FROM messages WHERE conversation_id = ?"
+                " ORDER BY seq DESC LIMIT 2",
+                (conversation_id,),
+            )
+            lines = []
+            for row in reversed(rows):
+                if row["role"] == "user":
+                    said = (row["text"] or "").strip()
+                    who = "制作人"
+                else:
+                    said = _subtitle(row["segments"])
+                    who = self.stage.get("names.self", "") or "她"
+                if said:
+                    lines.append(f"{who}：{said}")
+        else:
+            wanted = (text or "").strip()
+            earlier = [
+                one
+                for one in (heard or [])
+                if (one.get("text") or "").strip() != wanted
+            ][-2:]
+            lines = [
+                f"{_name_of(one)}：{(one.get('text') or '').strip()}"
+                for one in earlier
+                if (one.get("text") or "").strip()
+            ]
+        body = "\n".join(lines)
+        return body[-300:] if len(body) > 300 else body
+
+    def _named(self, text: str, qq_id: str = "", card: str = "") -> bool:
         """Whether the message says her name out loud, without an @.
 
         The names are the character's, so they live in the stage file (`names.mentions`),
         never in this module: a channel that hard-codes who it is playing is a channel
         somebody else cannot drop in. No list means only an @ counts, which is exactly
         how this channel worked before names were a thing.
+
+        A bot from `QQ_BOTS` saying 「ふゆ」 is not calling her: it *is* a ふゆ, and its card
+        is usually that very name. Answering it turns one impersonation into a conversation
+        — 「那句，ふゆ刚说过」 was exactly this, twice in one evening.
+
+        A *person* whose nickname is her name is the same problem without the bot register.
+        Somebody wearing 「黛冬优子」 and typing 「ふゆ、これ見て」 may be calling her or may be
+        talking about themselves, and the two readings cost opposite things: a missed reply
+        is one silent message, a wrong reply is her answering an impersonator as if it were
+        her own voice. So the bare name is not a call for them either. **An @ still is** —
+        that one cannot be ambiguous, and it is the escape hatch for a same-name regular.
         """
         said = text or ""
-        return any(name in said for name in stage_file.names(self.stage, "names.mentions"))
+        if qq_id and self.config.bot_of(qq_id):
+            return False
+        names = stage_file.names(self.stage, "names.mentions")
+        named = any(name in said for name in names)
+        if card and any(name and name in card for name in names):
+            if named:
+                # 只在他真的把名字说出来时记一行：这个人每说一句话都记，日志就没法看了。
+                self.log(f"qq: 同名的人用名字叫她，按旁听处理（{qq_id}，{_clip(card, 20)}）")
+            return False
+        return named
 
     async def _called(
         self,
@@ -1047,11 +1324,22 @@ class QQChannel:
             return
         sender = event.get("sender") or {}
         card = str(sender.get("card") or "") or str(sender.get("nickname") or "")
+        # 「@ふゆ /好感」 is a command with a name in front of it, and it used to be neither:
+        # `plain_text` only drops real at-segments, so a *typed* 「@ふゆ」 stayed in the line,
+        # `_accept` said 「not a command」, and the whole sentence went to the judge as chat —
+        # level 1, minus two points, for asking how she felt. `_unaddressed` strips the
+        # address; the result is only used when what is left really starts with a slash, so
+        # an ordinary sentence that happens to contain her name is untouched.
+        # 便宜的守卫：没有斜杠的句子不可能变成命令，连剥都不用剥（五十人的群里这是常态）。
+        if ("/" in text or "／" in text) and not text.startswith(("/", "／")):
+            bare = self._unaddressed(text)
+            if bare.startswith(("/", "／")):
+                text = bare
         # Commands are checked *before* the mute gate, on purpose: `/静音` is something a
         # person does to themselves, and a gate that also blocked commands would leave the
         # producer with no way back except `UPDATE qq_identities`. Being let through here
         # grants nothing — `_command` re-checks who is allowed to say what.
-        if text.startswith("/"):
+        if text.startswith(("/", "／")):
             await self._command(room, qq_id, card, text, private)
             return
         if self.identities.muted(qq_id):
@@ -1197,7 +1485,7 @@ class QQChannel:
                 call=self._calls(),
             ),
             *self.world.lookup(text, speaking=character_id),
-            *self.world.knowledge(text),
+            *self.world.knowledge(text, character_id),
         ]
         # 每轮都加，连她自己的插话也算：这是这个号怎么说话，不是这一句要回什么。
         sections.append(Section(Slot.TURN, LANG_NOTE, order=5, title="qq:lang"))
@@ -1271,9 +1559,21 @@ class QQChannel:
             )
         async with self._gate:
             async with self._lock(conversation.id):
+                # 判官要读的那两句背景，在这里算：`heard` 和会话 id 都只在这个函数里。
+                # 旁听和自言自语不判分（`affinity.mute`），所以也不算，省一次查询。
+                # `QQ_CALLED=0` 时一条 @ 是不带窗口进来的，就用屋里现成的那几行——
+                # 房间记得的事和她能读到的必须是同一批。
+                window = heard
+                if window is None and not private:
+                    window = list(self._heard.get(room) or [])
+                brief = (
+                    "" if (own or ambient)
+                    else self._brief(window, text, private, conversation.id)
+                )
                 await self._stream(
                     room, qq_id, character_id, user_id, conversation.id, text, photos,
-                    sections, message_id, private, ambient, stage, relation,
+                    sections, message_id, private, ambient, stage, relation, own=own,
+                    brief=brief,
                 )
 
     async def _stream(
@@ -1291,6 +1591,8 @@ class QQChannel:
         ambient: bool = False,
         stage: str = "",
         relation: str = "",
+        own: bool = False,
+        brief: str = "",
     ) -> None:
         buffers: dict[int, str] = {}
         spare: dict[int, str] = {}
@@ -1311,6 +1613,23 @@ class QQChannel:
         # ever, and two of them are the whole channel silent — which reads as 「有时候不回，
         # 过一阵又好了」 and is impossible to see from the outside.
         limit = max(1.0, float(self.config.turn_timeout))
+        facts: dict[str, Any] = {}
+        if private:
+            facts["affinity.loving"] = relation == "loving"
+        if own or ambient:
+            # 不是「对她说的」的一轮，判官不该给任何人记账。两种情形：
+            #
+            # - 她自己想到一件事、对着空气说：`text` 是一句旁白（`OWN_NUDGE`/`IDLE_NUDGE`），
+            #   judge 读到「（没有人叫你…）」会当成有人在对她下指令（实测 level 1、
+            #   manipulation=true），这个群友白掉两点；
+            # - 旁听接话：`text` 是**别人对屋里说的话**，那人并没有跟她说，却因为「被她
+            #   听见」加分或掉分。她插一句不该改变谁的数字。
+            facts["affinity.mute"] = True
+        brief = "" if (own or ambient) else brief
+        if brief:
+            # 判官只看到一句话时，短句只能猜：「好感」被判成敷衍（−5）就是这么来的。
+            # 前面几句是背景，不是要评判的内容——措辞在 `core/judge.py`。
+            facts["judge.brief"] = brief
         try:
             stream = self.app.turn(
                 character_id,
@@ -1328,7 +1647,7 @@ class QQChannel:
                 # 「我们在谈恋爱」 is a fact about the person, and only this channel knows it: the
                 # affinity plugin needs it to decide whether a low number may become a sulk
                 # instead of a distance. Nothing else reads the key.
-                extra_facts={"affinity.loving": relation == "loving"} if private else None,
+                extra_facts=facts or None,
             )
             async with asyncio.timeout(limit):
                 async for event in stream:
@@ -1466,6 +1785,10 @@ class QQChannel:
                 reply_to=message_id if first and message_id and address else "",
             )
             if not private:
+                # 她说出去的话也是这个房间的一部分。记在这里而不是记在 `_turn` 里：一段
+                # 回复可能被切成好几条（`SegmentComplete`），群里看到的是每一条，她记得的
+                # 也应该是每一条。
+                self._remember_self(room, piece)
                 self._last_spoke[room] = asyncio.get_running_loop().time()
         if sticker:
             # A segment that was nothing but `[贴纸]` is not an empty message: it is the
@@ -1517,7 +1840,7 @@ class QQChannel:
     async def _cringe(self, heard: list[dict[str, str]]) -> bool:
         """她会不会「说不出话」。模型答不上来就是不会——表情发出去就收不回来。"""
         lines = "\n".join(
-            f"{number}. {one.get('card') or '谁'}：{one.get('text') or ''}"
+            f"{number}. {_name_of(one)}：{one.get('text') or ''}"
             for number, one in enumerate(heard[-6:], 1)
         )
         try:
@@ -1599,7 +1922,7 @@ class QQChannel:
             relation,
             self.app.generation,
             self.presence.stamp(),
-            self.world.stamp(),
+            self.world.stamp(character_id),
         )
         if key in self._engines:
             return self._engines[key]
@@ -1614,7 +1937,7 @@ class QQChannel:
             base = (warm, *base)
         if head is not None:
             base = (head, *base)
-        roster = self.world.persona()
+        roster = self.world.persona(character_id)
         if roster is not None:
             base = (*base, roster)
         built = replace(engine, base=base) if base != engine.base else engine
@@ -2053,6 +2376,22 @@ class QQChannel:
         two threads, one person: memory and affinity are still keyed by the person."""
         return THREAD_DM if private else f"qq:group:{room}"
 
+    def _last_room(self) -> str:
+        """The group thread she spoke in most recently, as a conversation title.
+
+        Two rooms share one `group` affinity bucket, but the transcript is per room — so
+        「我说过什么」 without a room number has to pick one, and the last one she spoke in
+        is the only guess that does not need an argument.
+        """
+        rows = self.app.store.query(
+            "SELECT c.title FROM messages m"
+            " JOIN conversations c ON c.id = m.conversation_id"
+            " WHERE c.character_id = ? AND c.title LIKE 'qq:group:%'"
+            " AND m.role = 'assistant' ORDER BY m.seq DESC LIMIT 1",
+            (self.config.character,),
+        )
+        return str(rows[0]["title"]) if rows else ""
+
     def _thread(self, character_id: str, user_id: str, scene: str) -> Any:
         found = self.app.store.query(
             "SELECT id FROM conversations WHERE user_id = ? AND character_id = ? AND title = ?"
@@ -2134,6 +2473,45 @@ class QQChannel:
                 own_name = self.stage.get("names.self", "")
                 said = f"（{own_name}的心情：{label}）" if own_name else f"（心情：{label}）"
             await self._say(room, qq_id, said, private)
+            return
+        if name in ("我说过", "said"):
+            # 「这句是不是我说的」 has no answer from the outside: her replies live in the
+            # database, the window in memory is gone after a turn, and an impersonator in the
+            # room looks exactly like her. So the producer gets the receipt — and only him,
+            # only in the private chat, because a room reading her last six lines out loud
+            # would hand the impersonator the material.
+            #
+            # It reports the **group**, not this chat: that is where somebody can wear her
+            # name and answer for her. `/我说过 123456789` picks a room when she is in two;
+            # without an argument it answers about the room she spoke in last.
+            if not private or qq_id not in self.config.owners:
+                return
+            parts = text.split(maxsplit=1)
+            wanted = parts[1].strip() if len(parts) > 1 else ""
+            title = f"qq:group:{wanted}" if wanted else self._last_room()
+            rows = (
+                self.app.store.query(
+                    "SELECT m.created_at, m.segments FROM messages m"
+                    " JOIN conversations c ON c.id = m.conversation_id"
+                    " WHERE c.title = ? AND c.character_id = ? AND m.role = 'assistant'"
+                    " ORDER BY m.seq DESC LIMIT 6",
+                    (title, self.config.character),
+                )
+                if title
+                else []
+            )
+            lines = [
+                f"{_stamp(row['created_at'], self.app.settings.timezone)}  {one}"
+                for row in reversed(rows)
+                if (one := _subtitle(row["segments"]))
+            ]
+            where = f"「{wanted}」" if wanted else "这个群里"
+            await self.outbox.send(
+                room,
+                (f"（我最近在{where}说过的：）\n" + "\n".join(lines)) if lines
+                else f"（……我还没在{where}说过什么）",
+                private=private,
+            )
             return
         if name in ("阶段", "stage"):
             turns = self.identities.turns(qq_id)
@@ -2318,6 +2696,7 @@ def help_text(private: bool = False, shared: Sequence[str] = ("表情",)) -> str
             "（用法：直接跟我说话就行）\n"
             "/重开  换一个新的话题\n"
             "/好感  她现在的心情\n"
+            "/我说过 [群号]  我最近在群里说过的几句（核对用；只在这个私聊里回）\n"
             "/表情 [标签]  发一张表情（例：/表情 上班；不带标签就是你自己收藏的）\n"
             "/表情 同步  拉一次这个号里收藏的表情\n"
             "/表情标 标签  把最新收进来的那张命名\n"
@@ -2376,11 +2755,17 @@ def _face_urls(data: Any) -> list[str]:
 def _transcript(heard: list[dict[str, str]], limit: int = 600) -> str:
     """The few lines she happened to read, as one turn section. Never stored: this is the
     one thing a group gives her that a private chat does not, and it is deliberately the
-    only thing — the rest of the conversation went by without her."""
+    only thing — the rest of the conversation went by without her.
+
+    「你自己（刚说的）」 is in here too, because a room answers her: the line under hers is
+    usually a reply to it, and a transcript that leaves her own words out turns that reply
+    into a sentence about nothing."""
     body = _lines(heard, limit)
     return (
         "【刚才群里在说这些】下面几行是你自己看见的，之后不会记得。接一句就好："
-        "不要复述别人的话、不要逐条回应、不要总结。\n" + body
+        "不要复述别人的话、不要逐条回应、不要总结。"
+        "标着「你自己（刚说的）」的那几行是你自己刚才说的话——那是你说过的，不是别人说的。\n"
+        + body
     )
 
 
@@ -2396,6 +2781,7 @@ def _overheard(heard: list[dict[str, str]], limit: int = 600) -> str:
     return (
         "【刚才群里在说这些】下面几行是你自己看见的，之后不会记得。"
         "但没有人是在跟你说话——不用回答、不要复述、不要总结他们在聊什么。\n"
+        "标着「你自己（刚说的）」的那几行是你自己刚才说的话，别当成别人说的，也别重复它。\n"
         "你只是碰巧在场，然后想到一件自己的事。想说就说，不想说也可以很短。\n" + body
     )
 
@@ -2407,16 +2793,57 @@ def _lines(heard: list[dict[str, str]], limit: int) -> str:
     sentence, or 「她是女性」 becomes a label she has to remember to apply. This is also the
     only way a fact about *somebody else in the room* can reach her — the turn's 「对面是谁」
     only ever describes the person being answered.
+
+    `marks` is what the channel knows about this speaker beyond the name — 「另一个 bot」
+    「跟你同名，不是你」. It goes in the same bracket as the note, because a line labelled
+    「黛冬优子：…」 with nothing else is a line she has no way to tell from her own.
     """
     lines = []
     for row in heard:
         if not row.get("text"):
             continue
-        name = row.get("card") or "谁"
-        note = (row.get("note") or "").strip()
-        lines.append(f"{name}（{note}）：{row['text']}" if note else f"{name}：{row['text']}")
+        name = _name_of(row)
+        lines.append(f"{name}：{row['text']}")
     body = "\n".join(lines)
     return body[-limit:] if len(body) > limit else body
+
+
+def _subtitle(raw: Any) -> str:
+    """The line the room actually saw: the Chinese subtitle, falling back to the original.
+
+    `digest` wants her Japanese (the memory is written in her voice); a receipt for
+    「这是你说的吗」 wants what the group read, which is the subtitle.
+    """
+    try:
+        parts = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return ""
+    said = [
+        part[1] for part in parts if isinstance(part, list) and len(part) > 1 and part[1]
+    ]
+    if not said:
+        said = [part[0] for part in parts if isinstance(part, list) and part and part[0]]
+    return " ".join(said).strip()
+
+
+def _stamp(created_at: Any, tz: str | None) -> str:
+    """「10-30 14:08」, on the clock where the room is — not the server's, not UTC."""
+    try:
+        when = datetime.fromisoformat(str(created_at))
+    except (TypeError, ValueError):
+        return str(created_at)[:16]
+    return _local_time(when, tz).strftime("%m-%d %H:%M")
+
+
+def _name_of(row: dict[str, str]) -> str:
+    """The speaker, with whatever the channel knows about them in one parenthetical.
+
+    `marks` comes from `_marks` (another bot, same name as her), `note` from the
+    identity table (`/备注`). One bracket, because 「A（同名）（女性）」 reads like two people.
+    """
+    name = row.get("card") or "谁"
+    extra = [part for part in (row.get("marks"), row.get("note")) if part]
+    return f"{name}（{'；'.join(extra)}）" if extra else name
 
 
 def _character_name(app: Any, character_id: str) -> str:
@@ -2437,6 +2864,17 @@ _FIXED_HOURS = {"Asia/Tokyo": 9, "Asia/Shanghai": 8, "UTC": 0}
 `ZoneInfo` 要有系统时区库（Linux 有，某些机器上要装 `tzdata`）。装不上时退回这里，
 而不是退回「跑代码的这台机器的时区」—— 后者会让她在开发机上 23:30 醒着、在服务器上
 23:30 睡着，同一个时间两种行为。日本和中国都没有夏令时，写死是准确的。"""
+
+
+def _zone(name: str | None) -> Any:
+    """一个时区对象。没有 tzdata 时退回写死偏移（日本 +9，中国 +8，两者都没有夏令时）。"""
+    key = name or "UTC"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(key)
+    except Exception:
+        return timezone(timedelta(hours=_FIXED_HOURS.get(key, 0)))
 
 
 def _local_time(now: datetime, tz: str | None) -> datetime:

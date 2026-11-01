@@ -86,16 +86,32 @@ class Digest:
         timezone_name: str = "Asia/Shanghai",
         self_name: str = "",
         owner_name: str = "",
+        her_names: Sequence[str] = (),
+        character_id: str = "",
     ) -> None:
         """`self_name` is the short form she calls herself in the file, and only her own
         stage file knows it; `owner_name` is what the private chat calls him when the line is
         not addressed by nickname. Empty means the neutral wording — the file is hers, so a
-        checkout with no character data should not sign somebody else's name."""
+        checkout with no character data should not sign somebody else's name.
+
+        `her_names` is every name the room may use for her (`names.mentions`). A member who
+        renamed themselves 「黛冬优子」 would otherwise be written into the file as
+        `冬優子：…` — the same shape her own lines have — and a memory that says she said
+        something is a memory she will defend.
+        """
         self._self = (self_name or "").strip()
+        self._names = tuple(n for n in (self._self, *her_names) if n)
         self._owner = (owner_name or "").strip() or "对方"
         self._store = store
         self._llm = llm
-        self._dir = Path(characters) / "memory"
+        # 记忆是**她的**记忆，不是这个屋子的：两个人共用一份 `memory/group-<room>.md`，
+        # 换角色时下一个人会把它当成自己的经历读进去。所以目录按角色分；空 id 只留给
+        # 测试和单角色检查，`QQChannel` 永远传。
+        self._dir = (
+            Path(characters) / "memory" / character_id
+            if character_id
+            else Path(characters) / "memory"
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._log = log or (lambda line: None)
         self._zone = _zone(timezone_name)
@@ -187,7 +203,8 @@ class Digest:
             return None
         old = self.text(kind, key)
         transcript, dropped = _transcript(
-            rows, named=kind != DM, owner=self._owner, self_name=self._self
+            rows, named=kind != DM, owner=self._owner, self_name=self._self,
+            her_names=self._names,
         )
         prompt = self._prompt(heading, old, transcript, now)
         answer = await _collect(self._llm.stream(prompt))
@@ -251,7 +268,13 @@ class Digest:
 
 
 def _transcript(
-    rows: Sequence[Any], *, named: bool, owner: str = "对方", self_name: str = "", limit: int = MAX_INPUT
+    rows: Sequence[Any],
+    *,
+    named: bool,
+    owner: str = "对方",
+    self_name: str = "",
+    her_names: Sequence[str] = (),
+    limit: int = MAX_INPUT,
 ) -> tuple[str, int]:
     """The tail of the window, as plain lines. Returns it and how many were left out.
 
@@ -263,7 +286,9 @@ def _transcript(
     lines: list[str] = []
     size = 0
     for row in reversed(kept):
-        line = _line(row, named=named, owner=owner, self_name=self_name)
+        line = _line(
+            row, named=named, owner=owner, self_name=self_name, her_names=her_names
+        )
         if not line:
             continue
         if size + len(line) > limit:
@@ -275,11 +300,40 @@ def _transcript(
     return "\n".join(lines), dropped
 
 
-def _line(row: Any, *, named: bool, owner: str = "对方", self_name: str = "") -> str:
+def _line(
+    row: Any,
+    *,
+    named: bool,
+    owner: str = "对方",
+    self_name: str = "",
+    her_names: Sequence[str] = (),
+) -> str:
     if row["role"] == "user":
+        said = (row["text"] or "").strip()
+        if _stage_direction(said):
+            # 整句都在括号里的是旁白，不是谁说的话。她自己开口的那几轮，竖在「用户」位置上
+            # 的正是一句「（没有人叫你…）」；把它当成群友说过的话写进记忆，她就真的会以为
+            # 有人这样对她说过。
+            return ""
         who = (row["who"] or "谁") if named else owner
-        return f"{who}：{(row['text'] or '').strip()}"
+        if any(one and one in who for one in her_names):
+            # 名片跟她同名的人。写进记忆是 `冬優子：…`，和她自己那行的格式一模一样——一周
+            # 一次的重写会把这个错固化下来，之后她"记得"自己说过。
+            who = f"{who}（另一个人，只是同名）"
+        return f"{who}：{said}"
     return f"{self_name or '自己'}：{_her_words(row['segments'])}"
+
+
+def _stage_direction(text: str) -> bool:
+    """`「（……）」` and `"(……)"` only: something said and then bracketed is still something
+    said, and 「（笑）」 losing its line is cheaper than a stage direction becoming a fact."""
+    body = text.strip()
+    return (
+        len(body) >= 2
+        and body[0] in "（("
+        and body[-1] in "）)"
+        and body.count("（") + body.count("(") == 1
+    )
 
 
 def _her_words(raw: Any) -> str:

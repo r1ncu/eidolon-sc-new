@@ -31,6 +31,8 @@ characters/*
 !characters/README.md
 !characters/*.example.toml
 !characters/world/
+# 祝日表是公开数据（内阁府 CSV），不是角色内容：谁都可以用同一张
+!characters/calendar.toml
 
 characters/world/*
 !characters/world/README.md
@@ -41,6 +43,12 @@ characters/*.toml.bak*
 # ---- 3. 含角色内容的设计文档 ----------------------------------------------
 # 这份文档里有用某个具体角色算过的例子和她的等级，属于角色资料
 docs/恋爱状态与告白-*
+# 同理：内部方案与可行性报告里有真实群号、成员名单和她自己的数值，只留本地
+docs/通用化改造-*
+docs/修正方案-*
+
+# ---- 3b. 本机跑出来的草稿 ------------------------------------------------
+local_grown.txt
 
 # ---- 4. 缓存与编辑器 ------------------------------------------------------
 __pycache__/

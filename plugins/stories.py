@@ -27,6 +27,7 @@ will not parse — each costs the turn its excerpts, never its reply.
 
 import re
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,7 +55,13 @@ _NOTE = (
     "这类词。没撞上的部分就当没看见。"
 )
 
-_NAME_TAIL = ("黛冬優子", "黛 冬優子", "黛冬优子")
+_NAME_TAIL: tuple[str, ...] = ()
+"""卡名后面她的署名，由角色册/角色包给（`characters.card_tails`）。
+
+以前这里是写死的三个写法——那位角色换掉之后，标题里的名字就剥不干净。机制要留
+（不剥会把「【カード名】黛冬優子」当篇名念出来），内容搬到角色包：`names.toml [names] cards`
+优先，没写就从 `characters.toml` 的全名派生。
+"""
 
 _HAS_CJK = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _HAS_MARK = re.compile(r"[^\x00-\x7f]")
@@ -110,11 +117,17 @@ class Stories(Plugin):
         top: int = MAX_TOPICS,
         settle: float = 0.35,
         log: object | None = None,
+        pack: object | None = None,
+        tails: object | None = None,
     ) -> None:
         self._root = Path(directory)
         self._on = bool(on)
         self._top = max(1, top)
         self._log = log or (lambda line: print(line, flush=True))
+        self._pack = pack
+        """`pack(character_id) -> Pack` 或 None：剧情目录和话题表也进角色包。"""
+        self._tails = tails
+        """`tails(character_id) -> tuple[str, ...]` 或 None：卡名尾的写法。"""
         self._maps: dict[str, Live] = {}
         self._topic_cache: dict[str, tuple[tuple, tuple[Topic, ...]]] = {}
         self._indexes: dict[str, tuple[tuple, list[Scene], list[tuple[Scene, tuple[str, ...]]]]] = {}
@@ -202,15 +215,38 @@ class Stories(Plugin):
 
     # ---- reading the corpus without a service
 
+    def _dir_of(self, character_id: str) -> Path:
+        """`packs/<id>/facts-stories/` 优先，旧的 `facts/<id>-stories/` 兜底。"""
+        if self._pack is not None:
+            found = self._pack(character_id).path("story-files")
+            if found is not None:
+                return found
+        return self._root / "facts" / f"{character_id}-stories"
+
+    def _topics_path(self, character_id: str) -> Path:
+        if self._pack is not None:
+            found = self._pack(character_id).path("stories")
+            if found is not None:
+                return found
+        return self._root / "world" / f"{character_id}-stories.toml"
+
+    def _tail_of(self, character_id: str) -> tuple[str, ...]:
+        if self._tails is None:
+            return _NAME_TAIL
+        try:
+            return tuple(self._tails(character_id) or ())
+        except Exception:  # 一个坏角色包不该让剧情整段消失
+            return ()
+
     def _index(self, character_id: str) -> tuple[list[Scene], list[tuple[Scene, tuple[str, ...]]]]:
         """`facts/<id>-stories/` as scenes, re-scanned when a file changes. The scan
         is a handful of small reads; a turn that pays for it once pays milliseconds."""
-        root = self._root / "facts" / f"{character_id}-stories"
+        root = self._dir_of(character_id)
         stamp = _stamp(root)
         cached = self._indexes.get(character_id)
         if cached is not None and cached[0] == stamp:
             return cached[1], cached[2]
-        scenes = _scan(root)
+        scenes = _scan(root, self._tail_of(character_id))
         auto = _auto(scenes)
         self._indexes[character_id] = (stamp, scenes, auto)
         return scenes, auto
@@ -221,7 +257,7 @@ class Stories(Plugin):
         live = self._maps.get(character_id)
         if live is None:
             live = Live(
-                self._root / "world" / f"{character_id}-stories.toml",
+                self._topics_path(character_id),
                 settle=0.35,
                 log=self._log,
             )
@@ -257,7 +293,7 @@ class Stories(Plugin):
         return {("GET", "/api/stories"): state}
 
 
-def _scan(root: Path) -> list[Scene]:
+def _scan(root: Path, tails: Sequence[str] = ()) -> list[Scene]:
     """Every 話 in the corpus, in file order. A file that will not read is skipped,
     not fatal: one broken file costs the turns its scenes. `README.md` is the corpus's
     own documentation — its headings are not scenes."""
@@ -273,7 +309,7 @@ def _scan(root: Path) -> list[Scene]:
             continue
         rel = path.relative_to(root).as_posix()
         parts = re.split(r"^## ", text, flags=re.M)
-        card = _card_name(parts[0])
+        card = _card_name(parts[0], tails)
         for part in parts[1:]:
             title, _, body = part.partition("\n")
             title, body = title.strip(), _clean(body)
@@ -330,7 +366,7 @@ def _pick(scenes: list[Scene], file: str, fragment: str) -> list[Scene]:
     return out
 
 
-def _card_name(header: str) -> str:
+def _card_name(header: str, tails: Sequence[str] = ()) -> str:
     """`# 【オ♡フ♡レ♡コ】黛 冬優子` gives `オ♡フ♡レ♡コ`; a chapter file keeps its name.
     Only the first line: what follows it is the file's own preamble, not its name."""
     first = header.strip().splitlines()[0] if header.strip() else ""
@@ -338,7 +374,7 @@ def _card_name(header: str) -> str:
     found = re.match(r"^【(.+?)】", text)
     if found:
         return found.group(1).strip()
-    for tail in _NAME_TAIL:
+    for tail in tails:
         text = text.replace(tail, "")
     return text.strip()
 

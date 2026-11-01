@@ -166,6 +166,7 @@ const T = {
     loading: "正在读取…",
     categories: {
       profile: "档案",
+      world: "世界观",
       memories: "记忆",
       stats: "统计",
       call: "通话",
@@ -176,7 +177,25 @@ const T = {
       "data-package": "数据包",
       about: "关于",
     },
+    world: {
+      work: "作品",
+      workNone: "这个部署没有写 work.toml：作品名不会出现在任何提示词里。",
+      workOne: (title, agency) => (agency ? `${title} · ${agency}` : title),
+      workHint:
+        "作品是共享的：标题、事务所、聊到作品本身时的关键词，都只在这一个文件里。换一部作品只改这里。",
+      her: (name) => `${name} 的这一份`,
+      home: (p) => `角色包：${p}`,
+      noHome: "角色包：还没有 packs 目录，全部文件都在旧路径上。",
+      fallback: (list) => `仍在旧路径：${list}`,
+      noFallback: "所有文件都在角色包里。",
+      missing: (list) => `还没写：${list}`,
+      noMissing: "该有的都写好了。",
+      hint:
+        "「世界」是共享的事实；「她怎么看这个世界」只属于她——view.md（怎么看同事）和 world.md（怎么看作品）。两条线一起进提示词：只有事实，她是在念维基；只有看法，她没有站的地方。",
+    },
     summaries: {
+      worldShare: (n) => `共享 · ${n} 个关键词`,
+      worldNone: "没有 work.toml",
       addressDefault: "按各自的习惯",
       profileUnsaved: "有修改未保存",
       timezoneAuto: (tz) => `自动（${tz}）`,
@@ -471,6 +490,7 @@ const T = {
 const state = {
   userId: "",
   characters: [],
+  work: null,
   roster: [],
   selectedId: null,
   conversationId: null,
@@ -1360,7 +1380,7 @@ function shareCardHTML() {
 /* ------------------------------------------------------------------ 设置 */
 
 const SETTINGS_GROUPS = [
-  ["profile", "memories", "stats"],
+  ["profile", "world", "memories", "stats"],
   ["call", "reach-outs", "appearance", "own-keys"],
   ["sign-in", "data-package"],
   ["about"],
@@ -1368,6 +1388,7 @@ const SETTINGS_GROUPS = [
 
 const SETTINGS_ICONS = {
   profile: "profile",
+  world: "about",
   memories: "memories",
   stats: "stats",
   call: "phone",
@@ -1426,6 +1447,11 @@ function settingsSummary(category) {
       const saved = state.profile || {};
       const timezone = saved.timezone || T.settings.summaries.timezoneAuto(tz);
       return `${saved.address || T.settings.summaries.addressDefault} · ${timezone}`;
+    }
+    case "world": {
+      const w = state.work;
+      if (!w || !w.named) return T.settings.summaries.worldNone;
+      return T.settings.summaries.worldShare(w.words || 0);
     }
     case "memories":
       return state.memories.length === 0 ? T.settings.summaries.noMemories : T.settings.summaries.memories(state.memories.length);
@@ -2078,6 +2104,32 @@ function settingsPanelBody(category) {
           </div>
         </form>`
       );
+    }
+    case "world": {
+      const t = T.settings.world;
+      const w = state.work;
+      const c = state.characters.find((x) => x.id === state.selectedId) || state.characters[0] || null;
+      const pack = (c && c.pack) || null;
+      const title =
+        w && w.named ? t.workOne(w.title_zh || w.title || "", w.agency_zh || w.agency || "") : t.workNone;
+      const rows = [];
+      if (pack) {
+        rows.push(pack.home ? t.home(pack.home) : t.noHome);
+        rows.push(pack.fallback && pack.fallback.length ? t.fallback(pack.fallback.join("、")) : t.noFallback);
+        rows.push(pack.missing && pack.missing.length ? t.missing(pack.missing.join("、")) : t.noMissing);
+      }
+      return settingsSection(`<div class="${fieldGroupClass}">
+        <div class="flex flex-col gap-1">
+          <p class="${fieldLabelClass}">${esc(t.work)}</p>
+          <p class="text-subtitle text-muted-foreground">${esc(title)}</p>
+          <p class="${PROSE_WIDTH} text-subtitle text-muted-foreground">${esc(t.workHint)}</p>
+        </div>
+        <div class="flex flex-col gap-1">
+          <p class="${fieldLabelClass}">${esc(t.her(c ? c.name : "—"))}</p>
+          ${rows.map((row) => `<p class="text-subtitle text-muted-foreground">${esc(row)}</p>`).join("")}
+          <p class="${PROSE_WIDTH} text-subtitle text-muted-foreground">${esc(t.hint)}</p>
+        </div>
+      </div>`);
     }
     case "memories": {
       const list = state.memories.length
@@ -3780,6 +3832,7 @@ async function loadState() {
   if (!characterId) return;
   const out = await getJSON(`/api/state?c=${encodeURIComponent(characterId)}`);
   state.characters = out.characters || [];
+  state.work = out.work || state.work;
   state.userId = out.user_id || state.userId;
   state.conversationId = out.conversation_id;
   state.affinity = out.affinity || null;
@@ -3823,6 +3876,7 @@ async function boot() {
     if (first) {
       const out = await getJSON(`/api/state?c=${encodeURIComponent(first.id)}`);
       state.characters = out.characters || [];
+      state.work = out.work || null;
       state.userId = out.user_id || "";
       state.prefs = loadPrefs();
       // 外观（SCSP 头像开关）只存在这台设备上，原版 lib/appearance.ts 那样按用户分开存。
