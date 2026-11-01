@@ -21,6 +21,7 @@ ignored and the previous version is kept, so an editor's autosave cannot blank h
 the office for one turn.
 """
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,20 @@ MAX_IDOL = 1600
 summarised: a summary written by this file would be a second author of her memory of them."""
 
 MAX_META = 2200
+
+_NOTE = re.compile(r"<!--.*?-->", re.S)
+"""文件里的注释是写给改文件的人看的，不是给她看的。
+
+这几层是**整段注入**的：`office.md` 每轮都在，一份四十行的作品笔记，注释多的时候能有
+十几行进提示词，而它一个字的信息量都没有。以前没人管是因为注释少，所以放在入口统一
+去掉，而不是要求每个写文件的人记得别写注释。"""
+
+
+def _note_free(text: str) -> str:
+    """去注释，并收掉注释留下的空行：三个空行和零个空行一样，都不该占提示词。"""
+    rough = _NOTE.sub("", text or "")
+    return re.sub(r"\n{3,}", "\n\n", rough).strip()
+
 
 MAX_HITS = 2
 """Two colleagues in one message is already a strange message; more is a list, not a question."""
@@ -116,7 +131,7 @@ class World:
 
     def persona(self) -> Section | None:
         """The one-line-each roster, for the engine the channel builds."""
-        text = self._office.text()
+        text = _note_free(self._office.text())
         if not text:
             return None
         return Section(Slot.PERSONA, text, order=10, title="world:office")
@@ -149,7 +164,7 @@ class World:
 
     def knowledge(self, text: str) -> list[Section]:
         """The work itself — releases, events, the people who make them."""
-        meta = self._meta.text() if self._meta is not None else ""
+        meta = _note_free(self._meta.text()) if self._meta is not None else ""
         if not self._meta_on or not meta:
             return []
         said = (text or "").casefold()
@@ -164,7 +179,7 @@ class World:
                 self._world / "idols" / f"{character_id}.md", settle=0.0, log=self._log
             )
             self._idols[character_id] = file
-        return file.text()
+        return _note_free(file.text())
 
     def _alias_table(self) -> dict[str, tuple[str, ...]]:
         """The names in `characters.toml`, re-parsed when the file changes."""

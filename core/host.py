@@ -136,7 +136,17 @@ class Host:
         if not questions or self._judge is None:
             return
         try:
-            turn.facts.update(await self._judge.ask(questions, said=turn.text))
+            turn.facts.update(
+                await self._judge.ask(
+                    questions,
+                    said=turn.text,
+                    # What the channel knows and a plugin cannot: the couple of lines before
+                    # this one, and which room it is. Both are optional — a caller that fills
+                    # neither gets exactly the request it got before.
+                    brief=str(turn.facts.get("judge.brief") or ""),
+                    scene=turn.surface,
+                )
+            )
         except Exception:
             return
 
