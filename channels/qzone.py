@@ -28,7 +28,7 @@ import random
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -58,8 +58,9 @@ RECENT = 8
 """How many past posts the repeat check and the prompt look at."""
 
 RIGHT = {1: "所有人可见", 4: "好友可见", 16: "部分好友可见", 64: "仅自己可见", 128: "部分好友不可见"}
-"""`ugc_right`. 4 is the default: a persona account's diary belongs to its friends list, not
-to everyone who finds the number."""
+"""QQ 的 `ugc_right`。默认 1（所有人可见）：`voice/qzone.md` 里那份写作口径是按「外面
+有人在看着」写的，好友可见会让那句前提变成假的；NapCat 不给这个参数时也默认 1。
+改回 4 是部署自己的决定，写进 `QQ_QZONE_RIGHT` 即可。"""
 
 BANNED = ("AI", "ai", "机器人", "模型", "提示词", "prompt", "prompt", "系统消息", "角色扮演", "虚拟主播")
 """Words that mean she has stepped out of character. A 说说 is the one place nothing can
@@ -70,7 +71,7 @@ SCHEMA = (
     " id INTEGER PRIMARY KEY AUTOINCREMENT,"
     " tid TEXT NOT NULL DEFAULT '',"
     " content TEXT NOT NULL,"
-    " ugc_right INTEGER NOT NULL DEFAULT 4,"
+    " ugc_right INTEGER NOT NULL DEFAULT 1,"
     " ok INTEGER NOT NULL DEFAULT 1,"
     " error TEXT NOT NULL DEFAULT '',"
     " written_at TEXT NOT NULL,"
@@ -211,7 +212,7 @@ class Qzone:
         character: str = "",
         persona: str | Path | None = None,
         flags: Flags | None = None,
-        ugc_right: int = 4,
+        ugc_right: int = 1,
         hour: int = 21,
         chance: float = 0.35,
         gap: float = POST_GAP,
@@ -227,7 +228,7 @@ class Qzone:
         self._chars = character
         self._src = source(persona) if persona else None
         self._flags = flags or Memory()
-        self.right = ugc_right if ugc_right in RIGHT else 4
+        self.right = ugc_right if ugc_right in RIGHT else 1
         self.hour = hour
         self.chance = min(max(chance, 0.0), 1.0)
         self.gap = gap

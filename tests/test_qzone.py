@@ -89,7 +89,7 @@ class Base(unittest.TestCase):
         self.flags = space.Memory()
         self.logs: list[str] = []
 
-    def zone(self, *, bot=None, llm=None, chance=1.0, hour=21, gap=20.0, right=4,
+    def zone(self, *, bot=None, llm=None, chance=1.0, hour=21, gap=20.0, right=1,
              retry=space.RETRY_GAP) -> Qzone:
         return Qzone(
             bot or Bot(),
@@ -126,7 +126,7 @@ class TestPublishing(Base):
         action, params = bot.calls[0]
         self.assertEqual(action, "send_qzone_msg")
         self.assertEqual(params["content"], GOOD)
-        self.assertEqual(params["ugc_right"], 4, "默认好友可见")
+        self.assertEqual(params["ugc_right"], 1, "默认所有人可见")
         self.assertEqual(params["images"], [], "第一版只发文字")
 
     def test_the_post_is_written_down(self):
@@ -426,7 +426,7 @@ class TestTheSmallerPieces(Base):
         asyncio.run(zone.maybe())
         status = zone.status()
         self.assertEqual(status["hour"], 21)
-        self.assertEqual(status["right"], 4)
+        self.assertEqual(status["right"], 1)
         self.assertTrue(status["today"])
         self.assertEqual(len(status["recent"]), 1)
         self.assertTrue(status["recent"][0]["ok"])
@@ -497,9 +497,16 @@ class TestTheShapes(unittest.TestCase):
         self.assertGreaterEqual(space._similar("今天那句没唱顺。", "今天那句还是没唱顺。"), 0.6)
         self.assertLess(space._similar("今天那句没唱顺。", "走廊的灯关掉了。"), 0.2)
 
-    def test_the_right_defaults_to_friends_when_the_number_is_wrong(self):
+    def test_a_wrong_number_falls_back_to_public(self):
         zone = Qzone(Bot(), ScriptedLLM(GOOD), Store(":memory:"), ugc_right=7)
-        self.assertEqual(zone.right, 4)
+        self.assertEqual(zone.right, 1)
+
+    def test_the_deployment_default_is_public_but_can_be_narrowed(self):
+        from channels.config import QQConfig
+
+        self.assertEqual(QQConfig.from_env({}).qzone_right, 1, "不写就是公开")
+        self.assertEqual(QQConfig.from_env({"QQ_QZONE_RIGHT": "4"}).qzone_right, 4,
+                         "要收窄就明写 4")
 
     def test_content_error_carries_the_reason(self):
         with self.assertRaises(ContentError) as caught:

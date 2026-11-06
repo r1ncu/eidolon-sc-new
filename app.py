@@ -24,6 +24,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import json
+import re
 import uuid
 
 from core.events import KernelEvent
@@ -94,11 +95,15 @@ class App:
             labels=self.characters.name_of,
             start=settings.affinity_start,
             work=self.characters.work,
+            # 同一个人的几个形态共用一本好感（本体/幼年/if）；群聊和私聊仍然是两本。
+            root=self.characters.family,
         )
         self.memory = Memory(
             self.store,
             llm=chat,
             names=self.characters.name_of,
+            # 同一个人的另一条人生（`derived_from`）：那种记忆是「梦」，不是「听别人说的」。
+            kin=self.characters.same_person,
             timezone_name=settings.timezone,
             work=self.characters.work,
         )
@@ -247,7 +252,9 @@ class App:
         return Engine(
             self.store,
             self.llm,
-            base=_base_sections(character, self.recall, self.characters.pack(character.id)),
+            base=_base_sections(
+                character, self.recall, self.characters.pack(character.id), self.characters
+            ),
             host=self.host,
             history_turns=self.settings.history_turns,
             voiced_by=self.settings.voiced_by,
@@ -773,7 +780,7 @@ def _visits(days, today: date) -> dict:
 
 
 def _base_sections(
-    character: Character, recall: Recall, pack: object | None = None
+    character: Character, recall: Recall, pack: object | None = None, characters: Any = None
 ) -> tuple[Section, ...]:
     """人设、她的资料、她对世界的看法——都在 `persona` 槽。
 
@@ -793,6 +800,53 @@ def _base_sections(
             view = ""
     if view:
         sections.append(Section(Slot.PERSONA, view, title=f"{character.id}:view"))
+    # 名字的几种写法：中文译名、假名、罗马字，以及**去掉「（幼年）」「（if）」之后的本名**。
+    #
+    # 人设里通常只有日文名，而群里的人常常直接叫中文译名（「七草日花」）。模型没被告诉过
+    # 那是同一个名字，就会把人当成另一个人，回一句「不是日花」——她连自己都不认识了。
+    # 派生版本更糟：她的名字是「櫻木真乃（幼年）」，用户不会带着括号喊她，所以本名必须
+    # 单独列出来，而且排在前面。这一行跟人设一起缓存（对这个人不变）。
+    bare = lambda text: re.sub(r"\s*[（(][^）)]*[）)]\s*$", "", text).strip()
+    aliases: list[str] = []
+    for candidate in (
+        character.name,
+        character.name_zh,
+        character.name_kana,
+        character.name_romaji,
+    ):
+        if not candidate or not str(candidate).strip():
+            continue
+        short = bare(str(candidate).strip())
+        for form in (short, str(candidate).strip()):
+            if form and form not in aliases:
+                aliases.append(form)
+    if len(aliases) > 1:
+        sections.append(
+            Section(
+                Slot.PERSONA,
+                "# 你的名字\n"
+                + "、".join(aliases)
+                + " 指的都是你。别人用其中任何一个叫你——包括中文译名、也包括**不带后缀的本名**"
+                "——就是在叫你，不要否认，也不要说「不是某某」：那会显得你不认识自己。",
+                title=f"{character.id}:names",
+            )
+        )
+    # 另一个版本的她：记忆是同一本，但她只能当梦想起。这条规则跟着人设缓存，
+    # 因为它对这个人不变——什么时候问、问到哪一段，都不影响「那是梦」这个说法。
+    versions = characters.other_versions(character.id) if characters is not None else ()
+    if versions:
+        names = "、".join(one.name for one in versions)
+        sections.append(
+            Section(
+                Slot.PERSONA,
+                "# 关于另一个自己\n"
+                f"你还有另一个版本——{names}。她的那些日子你隐约记得，但像一场梦："
+                "没有亲身经历过的实感，时间、地点、细节全是模糊的。被问到的时候不要编，"
+                "用「不太记得」「好像是」「梦到过吧」这种说法带过去；别把它当成真的发生过，"
+                "也别主动拿它当谈资。",
+                title=f"{character.id}:kin",
+            )
+        )
     return tuple(sections)
 
 
@@ -868,6 +922,10 @@ def _urls(character: Character) -> dict:
         "avatar_url": f"/media/avatar/{character.id}" if character.avatar else "",
         "scsp_avatar_url": f"/media/avatar/{character.id}?set=scsp" if character.scsp_avatar else "",
         "background_url": f"/media/background/{character.id}" if character.background else "",
+        # 通话层单独一张底图；没配就是空，页面自己退回 background_url。
+        "call_background_url": (
+            f"/media/call-background/{character.id}" if character.call_background else ""
+        ),
     }
 
 

@@ -31,6 +31,7 @@ from core.settings import Settings
 from core.store import Store
 from plugins import affinity
 from plugins import packs as pack_file
+from plugins import tease as tease_file
 from serve import App
 
 SHIPPED = Path(__file__).resolve().parents[1] / "characters"
@@ -62,6 +63,39 @@ age = 20
 adult = true
 plove = 3
 heavy = 3
+
+[[characters]]
+id = "young"
+name = "テスト（10歳）"
+name_zh = "测试（10岁）"
+name_romaji = "Tesuto (age 10)"
+intro = "测试角色的幼年版：同一个人的十岁。"
+sheet = "sheets/young.md"
+age = 10
+adult = false
+plove = 0
+heavy = 1
+derived_from = "test"
+"""
+
+YOUNG_SHEET = "# 人设：测试角色（10 岁）\n\n你是十岁的测试角色，说话很短。\n"
+
+YOUNG_NIGHT_TOML = """\
+[rest]
+work = 20
+off = 20
+late = 0
+wake = 7
+cap = 3
+
+[lines]
+note = "【这个点你已经睡了】现在是 {when}。{how}\\n回一句，短。"
+turn = "第 {turn} 轮，第 {ends} 轮结束。{how}"
+ending = "这一轮说完就去睡。"
+more = "还没到结束那一轮。"
+far = "你迷迷糊糊醒了，有点怕，声音小小的。"
+trust = "你认得出他了，但真的困。"
+close = "是很熟的大人，所以你敢说「ねむい」。"
 """
 OFFICE = "# 面熟的人\n\n- あさひちゃん：テストの同僚。\n"
 IDOL = "# 芹沢あさひ\n\n- 呼び方：「あさひちゃん」。\n"
@@ -106,6 +140,11 @@ class FakeClient:
             raise RuntimeError("socket is gone")
         if action == "get_login_info":
             return dict(self.login)
+        if action in ("send_group_msg", "send_private_msg"):
+            # OneBot answers a send with the id it filed it under — that id is the whole of
+            # what a later 「引用」 carries. A fake that answered `{}` would hide the very
+            # path `Outbox.keep` exists for.
+            return {"message_id": 5000 + len(self.calls)}
         return {}
 
     async def call_raw(self, action: str, **params):
@@ -173,6 +212,53 @@ class TestSplit(unittest.TestCase):
         self.assertEqual(len(pieces), 3)
 
 
+class TestTheIdASendComesBackWith(unittest.IsolatedAsyncioTestCase):
+    """发送的回报里那个 id。「引用」只带 id，所以它值不值得留全看这里认不认得出来。"""
+
+    def test_the_shapes_onebot_answers_with(self):
+        self.assertEqual(outbox._said_id({"message_id": 12345}), "12345")
+        self.assertEqual(outbox._said_id({"message_id": "12345"}), "12345")
+        self.assertEqual(outbox._said_id({"message_id": 0}), "", "0 不是号，是没有")
+        self.assertEqual(outbox._said_id({}), "", "有的实现什么都不答")
+        self.assertEqual(outbox._said_id(None), "")
+
+    async def test_what_was_said_is_handed_back_with_its_id(self):
+        import tempfile
+        from pathlib import Path
+
+        from core.store import Store
+
+        store = Store(str(Path(tempfile.mkdtemp()) / "o.db"))
+        calls = []
+
+        async def call(action, **params):
+            calls.append(action)
+            return {"message_id": "srv-1"}
+
+        kept: list[tuple[str, str]] = []
+        box = outbox.Outbox(store, call, gap=(0.0, 0.0), retries=0, keep=lambda i, t: kept.append((i, t)))
+        store.migrate(box.migrations())
+        await box.send("100", "おはよう")
+        self.assertEqual(kept, [("srv-1", "おはよう")], "id 和正文一起交出去")
+
+    async def test_a_server_that_answers_nothing_keeps_nothing(self):
+        import tempfile
+        from pathlib import Path
+
+        from core.store import Store
+
+        store = Store(str(Path(tempfile.mkdtemp()) / "o.db"))
+
+        async def call(action, **params):
+            return {}
+
+        kept: list[tuple[str, str]] = []
+        box = outbox.Outbox(store, call, gap=(0.0, 0.0), retries=0, keep=lambda i, t: kept.append((i, t)))
+        store.migrate(box.migrations())
+        await box.send("100", "おはよう")
+        self.assertEqual(kept, [], "没有号就不要编一个：空的 id 存进去只会永远匹配不上")
+
+
 class TestFacesAreReadable(unittest.TestCase):
     """Reported by the user: 「群友发送的 [qq表情]，她不会读也不会回复」.
 
@@ -227,8 +313,64 @@ class TestFacesAreReadable(unittest.TestCase):
             {"type": "at", "data": {"qq": "999"}},
             {"type": "text", "data": {"text": " 在吗 "}},
         ]
-        self.assertEqual(outbox.plain_text(message), "在吗")
+        self.assertEqual(outbox.plain_text(message, self_id="999"), "在吗")
         self.assertFalse(outbox.faces("在吗"))
+
+    def test_the_at_of_somebody_else_keeps_their_name(self):
+        """「没关系，有@愛美 请客」曾经变成「没关系，有 请客」——不是短了，是没法接。
+
+        线上她答的是「请客的是你」，因为句子里那个「谁」被删掉了，她只能猜。
+        """
+        message = [
+            {"type": "at", "data": {"qq": "999"}},
+            {"type": "text", "data": {"text": " 没关系，有"}},
+            {"type": "at", "data": {"qq": "43"}},
+            {"type": "text", "data": {"text": " 请客"}},
+        ]
+        said = outbox.plain_text(
+            message,
+            self_id="999",
+            name_of=lambda qq: "愛美（早睡早起版）" if qq == "43" else "",
+        )
+        self.assertEqual(said, "没关系，有@愛美（早睡早起版） 请客")
+
+    def test_an_at_with_no_card_falls_back_to_the_number(self):
+        """没说过话的人没有名片——留号码也比把「他圈了谁」删掉强。"""
+        message = [
+            {"type": "at", "data": {"qq": "43"}},
+            {"type": "text", "data": {"text": " 请客"}},
+        ]
+        self.assertEqual(
+            outbox.plain_text(message, self_id="999", name_of=lambda qq: ""), "@43 请客"
+        )
+
+    def test_at_all_is_a_person_too(self):
+        message = [
+            {"type": "at", "data": {"qq": "all"}},
+            {"type": "text", "data": {"text": " 开会"}},
+        ]
+        self.assertEqual(outbox.plain_text(message, self_id="999"), "@全体成员 开会")
+
+    def test_a_quote_brings_the_line_back(self):
+        """引用段只带 id。「这句什么意思」没有那句原话就是一句没法接的话。"""
+        message = [
+            {"type": "reply", "data": {"id": "q1"}},
+            {"type": "text", "data": {"text": " 这句什么意思"}},
+        ]
+        said = outbox.plain_text(
+            message, self_id="999", quote_of=lambda i: "法餐我请" if i == "q1" else ""
+        )
+        self.assertEqual(said, "（引用：「法餐我请」） 这句什么意思")
+
+    def test_an_unknown_quote_says_so_instead_of_guessing(self):
+        """记不得那句就明说没看到——猜一句别人的话，比不接更糟。"""
+        message = [
+            {"type": "reply", "data": {"id": "gone"}},
+            {"type": "text", "data": {"text": " 这句"}},
+        ]
+        said = outbox.plain_text(message, self_id="999", quote_of=lambda i: "")
+        self.assertIn("没看到", said)
+        self.assertNotIn("引用：「」", said)
 
     def test_the_note_is_only_worth_a_section_when_one_was_sent(self):
         self.assertTrue(outbox.faces("[表情]"))
@@ -473,6 +615,37 @@ class TestWorld(unittest.TestCase):
         self.assertTrue(self.world.knowledge("生放送いつだっけ"))
 
 
+class TestWhatsInHerStageFile(unittest.TestCase):
+    """她的字在**两份**文件里：`names.toml`（哪些名字算她）和 `voice/stage.toml`（对面是谁）。
+
+    拆开之前是同一个 `world/<id>-stage.toml`，通道只读了后者，`names.*` 全落空——结果是
+    「说名字不算叫她、只有 @ 算」，而提示词里也永远没有她的中文名。这条用例守的就是合并。
+    """
+
+    def test_both_files_become_one_table(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "names.toml").write_text(
+            '[names]\nself = "私"\nmentions = "七草にちか、七草日花"\ncn = "日花"\ncn_full = "七草日花"\n',
+            encoding="utf-8",
+        )
+        (root / "stage.toml").write_text(
+            '[addressee]\nowner = "叫你的是你的制作人"\n[replies]\nunknown = "……"\n',
+            encoding="utf-8",
+        )
+        table = qq_module._stage_table(root / "stage.toml", root / "names.toml")
+        self.assertEqual(table["names.self"], "私")
+        self.assertEqual(stage_file.names(table, "names.cn"), ("日花",))
+        self.assertIn("制作人", table["addressee.owner"])
+        self.assertEqual(table["replies.unknown"], "……")
+
+    def test_a_missing_side_is_not_an_error(self):
+        """老部署只有合并文件、新包只有其中一份：两种都得能读。"""
+        root = Path(tempfile.mkdtemp())
+        (root / "names.toml").write_text('[names]\nself = "私"\n', encoding="utf-8")
+        self.assertEqual(qq_module._stage_table(None, root / "names.toml"), {"names.self": "私"})
+        self.assertEqual(qq_module._stage_table(None, None), {})
+
+
 class ChannelCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -485,6 +658,14 @@ class ChannelCase(unittest.IsolatedAsyncioTestCase):
         (root / "characters" / "world" / "office.md").write_text(OFFICE, encoding="utf-8")
         (root / "characters" / "world" / "fuyuko-qq.md").write_text(QQ_RULES, encoding="utf-8")
         (root / "characters" / "world" / "fuyuko-dm.md").write_text(DM_RULES, encoding="utf-8")
+        # 同一个人的十岁（`derived_from`）：好感记在本体名下，作息从自己的 night.toml 读。
+        (root / "characters" / "sheets" / "young.md").write_text(YOUNG_SHEET, encoding="utf-8")
+        young = root / "characters" / "packs" / "young" / "voice"
+        young.mkdir(parents=True)
+        (young / "qq.md").write_text(QQ_RULES, encoding="utf-8")
+        (young / "dm.md").write_text(DM_RULES, encoding="utf-8")
+        (young / "night.toml").write_text(YOUNG_NIGHT_TOML, encoding="utf-8")
+        self.root = root
         (root / "characters" / "world" / "meta.md").write_text(META, encoding="utf-8")
         (root / "characters" / "world" / "idols" / "asahi.md").write_text(IDOL, encoding="utf-8")
         # 「夹」的规则属于角色，不属于代码：没有这份文件，计数与许可都不生效。
@@ -897,6 +1078,28 @@ class TestSceneHead(unittest.TestCase):
         self.assertIsNone(plain.scene_head(presence.GROUP))
 
 
+class TestTheRoomIsAllProducers(unittest.TestCase):
+    """「群里每一个人都是制作人」是屋子的事实，写在通道里，不写在每个角色包里。
+
+    2026-11-06：群友说「我不是你的制作人桑吗」，她回「ちがいますー」。而人设开头那句
+    「你正在和你的制作人说话」指的是**一个人**，所以这条必须排在它前面。
+    """
+
+    def setUp(self):
+        self.rules = presence.Presence("【场景】群里很多人。\n【对面】{{addressee}}\n")
+
+    def test_a_group_gets_it_as_a_persona_section(self):
+        head = self.rules.crowd_head(presence.GROUP)
+        self.assertIsNotNone(head)
+        self.assertEqual(head.slot, "persona")
+        self.assertIn("每一个人都是这个企划的制作人", head.text)
+        self.assertIn("另一个 bot", head.text, "例外要写在同一段里，否则标记了也没人认")
+
+    def test_a_private_chat_does_not(self):
+        """私聊里「对面是谁」已经说清楚了；再摆一句「群里每个人都是 P」会让她端起对外样子。"""
+        self.assertIsNone(self.rules.crowd_head(presence.PRIVATE))
+
+
 class TestScenesDoNotShareAnEngine(ChannelCase):
     async def test_group_and_private_get_different_prompts(self):
         self.channel.config = QQConfig(
@@ -907,6 +1110,22 @@ class TestScenesDoNotShareAnEngine(ChannelCase):
         direct = self.channel._engine("test", presence.PRIVATE)
         self.assertIsNot(group, direct, "each scene keeps its own cached prompt")
         self.assertIs(self.channel._engine("test", presence.PRIVATE), direct, "and reuses it")
+
+    async def test_the_room_rule_is_the_first_thing_she_reads(self):
+        """「群里都是制作人」排在 persona 最前——人设开头那句是「你正在和你的制作人说话」。"""
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            private=True, private_ids=("42",), character="test", merge_seconds=0.0,
+        )
+        group = self.channel._engine("test", presence.GROUP)
+        self.assertIn("每一个人都是这个企划的制作人", group.base[0].text)
+        self.assertIn("另一个 bot", group.base[0].text)
+        direct = self.channel._engine("test", presence.PRIVATE)
+        self.assertNotIn(
+            "每一个人都是这个企划的制作人",
+            " ".join(section.text for section in direct.base),
+            "私聊里不该有这一句",
+        )
 
 
 class TestTemplateHygiene(unittest.TestCase):
@@ -2165,6 +2384,114 @@ class TestCalled(ChannelCase):
         await self.say(event("ふゆ今晚唱什么", qq="43", message_id="n2", at=""))
         self.assertEqual(self.client.calls, [], "没有名字表 → 普通群消息 → 插话关着 → 安静")
 
+    async def test_the_short_name_the_room_types_is_a_call(self):
+        """「日花在吗」曾经什么都不是：`mentions` 里只有全名。
+
+        群里看到的就是「叫了没反应」，而用户的诊断是「要我强调『にちか的中文是日花』之后
+        才知道是在叫她」——那不是模型的错，是这行字根本没进「叫她」这份名单。
+        """
+        self.channel.stage = {
+            **self.channel.stage,
+            "names.mentions": "七草にちか、七草日花",
+            "names.cn": "日花、にちか",
+            "names.cn_full": "七草日花",
+        }
+        await self.say(event("日花在吗", qq="43", message_id="cn1", at=""))
+        self.assertTrue(self.client.texts, "短名也算叫她")
+
+    def test_a_one_character_name_only_counts_where_a_name_is_called(self):
+        """「透」在「看透」「透明」里是词的一部分；应了这些才叫坏。
+
+        两个字往上的名字在中文里足够独特，随便匹配；一个字的不行——这是数据里唯一
+        需要代码多看一眼的地方（`names.cn = "透"`）。
+        """
+        self.channel.stage = {**self.channel.stage, "names.mentions": "", "names.cn": "透"}
+        for said, want in (
+            ("透、これ見て", True),
+            ("透在吗", True),
+            ("@透 听得到吗", True),
+            ("我看透了", False),
+            ("透明な話", False),
+            ("渗透率多少", False),
+        ):
+            self.assertEqual(self.channel._named(said), want, said)
+
+    async def test_she_sees_who_else_was_mentioned(self):
+        """别人被圈进来的名字必须留在句子里，而且她要被告知「@」是什么意思。
+
+        线上原话：「@にちか 没关系，有@愛美（早睡早起版） 请客」→ 她答「请客的是你」。
+        """
+        payload = event("没关系，有 请客", qq="43", message_id="at1")
+        payload["message"] = [
+            {"type": "at", "data": {"qq": "999"}},
+            {"type": "text", "data": {"text": "没关系，有"}},
+            {"type": "at", "data": {"qq": "43", "name": "愛美"}},
+            {"type": "text", "data": {"text": " 请客"}},
+        ]
+        await self.say(payload)
+        prompt = " ".join(
+            str(message.content) for batch in self.app.llm.seen for message in batch
+        )
+        self.assertIn("@愛美", prompt, "别人的 @ 不能被删掉")
+        self.assertIn("圈了群里的另一个人", prompt, "而且要告诉她 @ 是什么意思")
+        self.assertNotIn("@999", prompt, "叫她自己的那个记号还是要去掉")
+
+    async def test_a_quote_of_an_earlier_line_is_readable(self):
+        """有人按着上一条问「这句什么意思」，她要看到被引用的那句。
+
+        第一句没叫她，也不会回，但「他说过什么」要记住——引用引的常常正是这种。
+        """
+        await self.say(event("法餐我请", qq="44", message_id="m-old", at=""))
+        payload = event("这句什么意思", qq="43", message_id="m2")
+        payload["message"] = [
+            {"type": "reply", "data": {"id": "m-old"}},
+            {"type": "at", "data": {"qq": "999"}},
+            {"type": "text", "data": {"text": " 这句什么意思"}},
+        ]
+        await self.say(payload)
+        prompt = " ".join(
+            str(message.content) for batch in self.app.llm.seen for message in batch
+        )
+        self.assertIn("法餐我请", prompt, "被引用的那句要回到提示词里")
+
+    async def test_a_quote_of_her_own_line_is_readable(self):
+        """引用**她**刚说的那句也一样：id 是发送时 OneBot 回给我们的，不是收进来的。
+
+        以前这条路是断的——`Outbox` 把 QQ 的响应扔掉了，于是「引用她的回复」永远只能
+        落到「一条你没看到的消息」。她现在至少能认出那是自己说的哪一句。
+        """
+        await self.say(event("今晚有空吗", message_id="q1"))
+        self.assertEqual(self.client.texts[:2], ["早上好", "今天真早啊"])
+        mine = [key for key in self.channel._quotes if key.startswith("50")]
+        self.assertEqual(len(mine), 2, "她说的两条都要有号")
+        # 引用她发出去的第一条
+        payload = event("这句什么意思", qq="43", message_id="q2")
+        payload["message"] = [
+            {"type": "reply", "data": {"id": mine[0]}},
+            {"type": "at", "data": {"qq": "999"}},
+            {"type": "text", "data": {"text": " 这句什么意思"}},
+        ]
+        await self.say(payload)
+        prompt = " ".join(
+            str(message.content) for batch in self.app.llm.seen for message in batch
+        )
+        self.assertIn("早上好", prompt, "她自己那句要能回到提示词里")
+        self.assertNotIn("没看到的消息", prompt, "认得出来就不要说没看到")
+
+    async def test_she_is_told_how_her_name_is_written_in_chinese(self):
+        """认得「日花」是代码的事，认得「这字就是我」是提示词的事——两件都要有。"""
+        self.channel.stage = {
+            **self.channel.stage,
+            "names.cn": "日花、にちか",
+            "names.cn_full": "七草日花",
+        }
+        await self.say(event("こんばんは", message_id="nm1"))
+        prompt = " ".join(
+            str(message.content) for batch in self.app.llm.seen for message in batch
+        )
+        self.assertIn("七草日花", prompt)
+        self.assertIn("「日花」「にちか」", prompt)
+
     async def test_the_room_travels_with_the_reply(self):
         """被叫到不再只听见那一句：前面几句跟着一起来了。"""
         self.named()
@@ -2405,7 +2732,7 @@ class TestSpeakingIntoAQuietRoom(AmbientCase):
         self.channel._rng = Coin(0.0, 0.0, 0.0)
         # 周日 23:30：休息日，但今晚掷到 0 小时——和平时一样 23:00 就睡了。
         # 掷到几就熬几小时，见 `TestTheHoursSheKeeps`。
-        self.channel._flag_set("sleep:2026-10-25", "0")
+        self.channel._flag_set("sleep:test:2026-10-25", "0")
         night = datetime(2026, 10, 25, 23, 30, tzinfo=timezone.utc)
         self.assertFalse(await service._maybe_idle(now=night), "睡觉了不开口")
         morning = datetime(2026, 10, 25, 10, 0, tzinfo=timezone.utc)
@@ -3272,14 +3599,29 @@ class TestTheTwoOfThemAreTogether(ChannelCase):
         self.assertEqual(self.channel.hold_affinity(), 1)
         self.assertEqual(self.value_of(user), 90.0)
 
-    async def test_she_writes_first_only_when_they_are_together(self):
-        self.assertFalse(await self.channel.love_ping("42"), "not yet")
-        self.assertEqual(self.client.texts, [])
+    async def test_she_writes_first_whether_or_not_they_are_together(self):
+        """主动开口不是恋爱功能——恋爱只改这句说什么。
 
-        self.together()
+        以前这里要求先 `loving`：关系没成立，她永远在等他先说话。偶像当然可以先给制作人发
+        一句「收录改时间了」，那句和「忽然想他了」是两个位置，不是两道门。
+        """
         self.assertTrue(await self.channel.love_ping("42"))
         self.assertEqual(len(self.client.texts), 2)  # the scripted reply, in two segments
         self.assertEqual(self.client.calls[0][0], "send_private_msg")
+        self.assertIn(
+            "说什么由你们现在的关系决定",
+            "\n".join(message.content for message in self.app.llm.seen[-1]),
+            "还没在一起：用的是「她先开口」那段旁白",
+        )
+
+        self.client.calls.clear()  # `texts` 是从 calls 里读出来的
+        self.together()
+        self.assertTrue(await self.channel.love_ping("42"))
+        self.assertIn(
+            "忽然想他了",
+            "\n".join(message.content for message in self.app.llm.seen[-1]),
+            "在一起了才换成「想他了」",
+        )
 
     async def test_off_means_off(self):
         self.together()
@@ -3290,6 +3632,30 @@ class TestTheTwoOfThemAreTogether(ChannelCase):
         )
         self.assertFalse(await self.channel.love_ping("42"))
         self.assertEqual(self.client.texts, [])
+
+    async def test_the_private_switch_is_the_one_she_obeys(self):
+        """网页上把「私聊」拨掉，她就连一条都不发；拨回来，下一轮就能发。
+
+        这是「整合」的意思：`QQ_OWNER_LOVE_PING` 不再是第二把钥匙，开关只有页面上的那一个。
+        运行时的覆盖存在 `qq_flags` 里，所以这里先建表，再真的去拨它。
+        """
+        self.together()
+        self.app.store.execute(
+            "CREATE TABLE IF NOT EXISTS qq_flags ("
+            " key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)"
+        )
+
+        self.channel.set_switch("private", False)
+        self.assertFalse(await self.channel.love_ping("42"), "私聊关着，主动私聊也没有")
+        self.assertEqual(self.client.texts, [], "连模型都不叫")
+        self.assertFalse(
+            qq_module.status(self.channel)["love_ping"], "页面上也别显示成「开」"
+        )
+
+        self.channel.set_switch("private", True)
+        self.assertTrue(await self.channel.love_ping("42"))
+        self.assertEqual(self.client.calls[0][0], "send_private_msg")
+        self.assertTrue(qq_module.status(self.channel)["love_ping"])
 
 
 class Recorder:
@@ -3615,15 +3981,20 @@ class TestSpeakingFirstOnDemand(ChannelCase):
         self.assertFalse(await self.channel.speak_up("100", force=True))
         self.assertEqual(self.client.texts, [])
 
-    async def test_the_private_ping_skips_the_schedule_but_not_the_relationship(self):
-        self.assertFalse(
-            await self.channel.love_ping("42", force=True), "还没在一起，不能撒娇"
+    async def test_a_forced_ping_skips_the_schedule_not_the_switch(self):
+        self.assertTrue(
+            await self.channel.love_ping("42", force=True), "还没在一起也能先开口"
         )
-        self.assertEqual(self.client.texts, [])
-        self.channel.identities.resolve("42", card="", role="owner")  # 得先有这一行
-        self.channel.identities.set_loving("42", True)
-        self.assertTrue(await self.channel.love_ping("42", force=True))
         self.assertTrue(self.client.texts)
+
+        self.client.calls.clear()  # `texts` 是从 calls 里读出来的
+        self.channel.config = QQConfig(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            character="test", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=True, ambient_idle=45.0, private=False,
+        )
+        self.assertFalse(await self.channel.love_ping("42", force=True), "开关就是开关")
+        self.assertEqual(self.client.texts, [])
 
     async def test_the_endpoint_says_why_when_the_channel_is_not_running(self):
         from channels.plugin_qq import QQService
@@ -4551,6 +4922,15 @@ class TestLoveWindow(unittest.TestCase):
         config = QQConfig(character="someone", love_ping=True)
         self.assertEqual((config.love_ping_min, config.love_ping_max), (60.0, 150.0))
 
+    def test_the_private_switch_is_the_one_that_governs_it(self):
+        """私聊开着、又在一起，她就会先写信——不再需要第二个 `.env` 开关。
+
+        以前默认是关的：部署者在网页上把私聊拨开，什么也不会发生，因为「她会不会先发消息」
+        是另一把钥匙，而那把钥匙只在 `.env` 里，页面上根本看不见。
+        """
+        self.assertTrue(QQConfig(character="someone").love_ping, "默认跟随私聊开关")
+        self.assertFalse(QQConfig(character="someone", love_ping=False).love_ping)
+
 
 class TestHerOwnStickers(ChannelCase):
     """「我的收藏」里的那叠表情要真的用得上。
@@ -5443,8 +5823,11 @@ class TestTheHoursSheKeeps(AmbientCase):
         self.channel._clock = lambda: when
 
     def dice(self, day: str, hours: int) -> None:
-        """替她掷好的那一夜：直接写进 `qq_flags`，免得测试依赖随机数。"""
-        self.channel._flag_set(f"sleep:{day}", str(hours))
+        """替她掷好的那一夜：直接写进 `qq_flags`，免得测试依赖随机数。
+
+        键里有角色：两台人格不到同一份睡眠账本（见 `QQChannel._late_hours`）。
+        """
+        self.channel._flag_set(f"sleep:{self.channel.config.character}:{day}", str(hours))
 
     def test_a_workday_night_is_asleep(self):
         """周三晚上（明天周四要上班）23:00 睡。——周五晚上不再是这种晚上，见下一条。"""
@@ -5493,6 +5876,34 @@ class TestTheHoursSheKeeps(AmbientCase):
         self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 0, 30)), "还在那一觉里")
         self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 8, 59)))
 
+    def test_a_bedtime_after_midnight_belongs_to_the_next_day(self):
+        """凌晨 1 点才睡的人：正午问「睡了吗」，不能答「在睡」。
+
+        她的钟点是 `work = 1`——这一夜是明天 01:00 睡、明天 07:00 醒。旧写法把 01:00 读成
+        「**今天**凌晨一点上床」，于是正午十二点也落在 [今天 01:00, 明天 07:00) 里，
+        她整个白天都醒不过来。
+        """
+        self.config()
+        self.channel._night = pack_file.NightRule(work=1, wake=7)
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 28, 12, 0)), "正午不在那一觉里")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 28, 10, 0)), "上午十点也不在")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 29, 0, 30)), "0:30 还没上床")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 1, 30)), "凌晨 1:30 睡了")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 6, 59)), "6:59 还在睡")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 29, 7, 0)), "7 点醒了")
+
+    def test_midnight_is_a_real_bedtime(self):
+        """`work = 0` 是午夜十二点睡，不是「没写」。
+
+        旧写法拿 0 当哨兵（`rule.work or REST_HOURS[0]`），于是 `0 or 23` 回退成 23 点。
+        """
+        self.config()
+        self.channel._night = pack_file.NightRule(work=0, wake=7)
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 28, 23, 30)), "23:30 还醒着")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 0, 30)), "0:30 已睡")
+        self.assertTrue(self.channel.resting(self.local(2026, 10, 29, 6, 59)), "6:59 还在睡")
+        self.assertFalse(self.channel.resting(self.local(2026, 10, 29, 7, 0)), "7 点醒了")
+
     def test_the_roll_is_made_once_and_kept(self):
         """同一夜两次问，答案必须一样：不存库的话，她会在 0:30 醒、0:40 又睡。"""
         self.config()
@@ -5501,7 +5912,7 @@ class TestTheHoursSheKeeps(AmbientCase):
         self.channel._rng = Coin(0.0)  # 就算骰子换了，也不该再掷
         second = self.channel._late_hours(date(2026, 10, 31))
         self.assertEqual((first, second), (3, 3))
-        self.assertEqual(self.channel._flag("sleep:2026-10-31"), "3")
+        self.assertEqual(self.channel._flag("sleep:test:2026-10-31"), "3")
 
     def test_a_database_that_cannot_take_the_roll_does_not_reroll(self):
         """库写不进去（表没建、盘满）时，这一夜也得是同一个数。
@@ -5571,6 +5982,233 @@ class TestTheHoursSheKeeps(AmbientCase):
         self.assertIn("不耐烦", mid)
         self.assertIn("抱怨", close, "亲近的人：抱怨其实是担心")
         self.assertEqual(len({far, mid, close}), 3)
+
+
+class TestADerivedAge(AmbientCase):
+    """同一个人的十岁（`derived_from = "test"`）。
+
+    她是**同一个人的另一个形态**：好感共用本体那一行（2026-11-06 改的规矩，之前是各记各的），
+    但几点睡、被叫醒时怎么说从自己的 `voice/night.toml` 读，夹子/档位声线/剧情也不继承。
+    机制跟成年那一版完全一样，只是那几句话是她的。
+    """
+
+    def young(self, **overrides) -> None:
+        base = dict(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            character="young", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=True, ambient_p=1.0, ambient_check=0.0, ambient_gap=0.0,
+            ambient_heard=8, ambient_sticker_p=0.0, ambient_own_p=0.0,
+            owner_affinity=100.0,
+        )
+        base.update(overrides)
+        self.channel.config = QQConfig(**base)
+        # 换一个角色就是换一个人：那三样从她自己的包里重新读一遍（通道里是构造时读的）。
+        self.channel.files = self.app.characters.pack(base["character"])
+        self.channel._night = pack_file.night_rule(self.channel.files)
+        self.channel._tease = tease_file.tease_rule(self.channel.files)
+
+    def at(self, *args) -> datetime:
+        """把她的钟钉在日本时间的这一刻（她是日本人，作息看日本的钟）。"""
+        when = datetime(*args, tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc)
+        self.channel._clock = lambda: when
+        return when
+
+    def test_her_bedtime_is_her_own(self):
+        """她 20:00 睡、7:00 醒——同一个 `resting`，只是数字从她自己的文件里来。"""
+        self.young()
+        self.assertTrue(self.channel.resting(self.at(2026, 10, 28, 20, 30)))
+        self.assertFalse(self.channel.resting(self.at(2026, 10, 28, 19, 30)))
+        self.assertTrue(self.channel.resting(self.at(2026, 10, 29, 6, 59)), "还没到七点")
+        self.assertFalse(self.channel.resting(self.at(2026, 10, 29, 7, 0)))
+
+    def test_the_other_age_is_still_up_at_eight(self):
+        """二十岁的那位没写 night.toml，走通道默认：20:30 她还没睡。
+
+        这不是「幼年版睡得早」，是「没写文件的那位用默认值」——两条路都在同一段代码里。
+        """
+        self.young(character="test")
+        self.assertFalse(self.channel.resting(self.at(2026, 10, 28, 20, 30)))
+        self.assertTrue(self.channel.resting(self.at(2026, 10, 28, 23, 30)))
+
+    def test_the_she_was_woken_line_is_hers(self):
+        """被吵醒那几句从她的文件里来：不是成年的「冷、不方便」，是「迷迷糊糊、有点怕」。"""
+        self.young()
+        self.at(2026, 10, 28, 21, 40)
+        note = self.channel._night_note(10)
+        self.assertIn("迷迷糊糊", note)
+        self.assertNotIn("很不高兴", note, "那是成年那一版的句子")
+        self.assertIn("21:40", note, "她知道现在几点")
+
+    def test_her_night_is_shorter(self):
+        """被吵醒以后最多聊三轮：小孩子的「被吵醒」撑不了六轮。"""
+        self.young()
+        self.assertEqual(self.channel._night_cap(), 3)
+        self.young(character="test")
+        self.assertEqual(self.channel._night_cap(), qq_module.NIGHT_CAP, "没写就走默认")
+
+    def test_the_producers_floor_applies_to_her_too(self):
+        """地板管的是**他跟她这个人**的关系：演她的另一个形态时，抬的还是同一行。
+
+        （2026-11-06 改的规矩：好感按人物记，形态只是形态。）
+        """
+        self.young()
+        user = self.channel.identities.resolve("42", card="", role="owner")
+        self.app.store.execute(
+            "INSERT INTO affinity_scenes"
+            " (user_id, character_id, surface, value, updated_at, cooling)"
+            " VALUES (?, 'test', 'dm', 12.0, ?, 0)",
+            (user, datetime.now(timezone.utc).isoformat()),
+        )
+        self.assertEqual(self.channel.hold_affinity(), 1, "同一行，地板照样抬")
+        rows = self.app.store.query(
+            "SELECT value FROM affinity_scenes"
+            " WHERE user_id = ? AND character_id = 'test' AND surface = 'dm'", (user,)
+        )
+        self.assertEqual(float(rows[0]["value"]), 100.0)
+
+    def test_the_same_producer_has_one_number_for_both_of_them(self):
+        """两个形态共用一行：写幼年就是写本体，反过来也一样。群聊、私聊仍旧各算各的。"""
+        self.young()
+        user = self.channel.identities.resolve("42", card="", role="owner")
+        self.app.affinity.set_value(user, "young", 95.0, surface="dm")
+        self.assertAlmostEqual(
+            float(self.app.affinity.read(user, "test", surface="dm").value), 95.0, places=3,
+            msg="写在她另一个形态名下，本体读到的就是同一个数",
+        )
+        self.app.affinity.change(user, "test", -5.0, surface="dm")
+        self.assertAlmostEqual(
+            float(self.app.affinity.read(user, "young", surface="dm").value), 90.0, places=3,
+            msg="扣本体，幼年也跟着动",
+        )
+        rows = self.app.store.query(
+            "SELECT value FROM affinity_scenes"
+            " WHERE user_id = ? AND character_id = 'young' AND surface = 'dm'", (user,)
+        )
+        self.assertEqual(rows, [], "幼年不该再留自己的一行")
+
+    def test_two_ages_do_not_share_a_sleep(self):
+        """睡眠账本按角色记：今晚她掷到几，跟二十岁的那位不是同一个数。
+
+        她的 `late` 写的是 0（十岁不熬夜），所以只会掷到 0；二十岁的那位没写，走默认 4，
+        于是能掷到 3。两个数不同，说明这两本账确实是分开的。
+        """
+        self.young()
+        self.channel._rng = Coin(0)
+        self.channel._late_hours(date(2026, 10, 31))
+        self.assertEqual(self.channel._flag("sleep:young:2026-10-31"), "0")
+        self.young(character="test")
+        self.channel._rng = Coin(3)
+        self.channel._late_hours(date(2026, 10, 31))
+        self.assertEqual(self.channel._flag("sleep:test:2026-10-31"), "3")
+        self.assertEqual(self.channel._flag("sleep:young:2026-10-31"), "0", "她那一夜没变")
+
+    async def test_the_love_loops_are_not_hers(self):
+        """「她等太久会自己开口」那条循环根本不该挂起来——那句话是主角色才有的。"""
+        self.young(owner_love=95.0, owners=("42",))
+        lines: list[str] = []
+        service = plugin_qq.QQService(
+            self.app, self.channel.config, client=self.client, log=lines.append
+        )
+        service.channel = self.channel
+        self.assertEqual(service.derived, "test", "她是 test 的另一个年纪")
+        service._start()  # 只跑「挂循环 + 打印报告」，不去连 OneBot
+        joined = "\n".join(lines)
+        self.assertIn("没有地板", joined, "地板那条日志不该说「不低于 100」")
+        self.assertNotIn("她可能自己开口", joined, "告白那条循环没挂")
+
+    def test_she_has_no_tease_rule(self):
+        """「夹」是成年那一版的招牌：她的包里没有 tease.toml，这个功能对她不存在。"""
+        self.young()
+        self.assertFalse(self.channel._tease.on)
+        self.assertIsNone(self.channel.files.path("tease"))
+        self.assertIsNone(self.channel.files.path("tiers"), "档位声线也不继承")
+
+
+class TestTheSleepSwitch(AmbientCase):
+    """关掉作息：`.env` 里 `QQ_SLEEP=0`，或她自己那份 `night.toml` 写 `enabled = false`。
+
+    关掉的是**整套**，不是「今晚不睡」：不掷那一夜的骰子、不写睡眠账本、深夜被 @ 也没有
+    「被吵醒」那一段。想只挪钟点别关它，去改 `night.toml` 的 `work` / `wake`。
+    """
+
+    def her(self, **overrides) -> None:
+        """切换角色/开关之后那三样要从她自己的包里重读一遍（通道是构造时读的）。"""
+        base = dict(
+            enabled=True, groups=("100",), self_id="999", owners=("42",),
+            character="young", merge_seconds=0.0, member_cooldown=0.0,
+            ambient=True, ambient_p=1.0, ambient_check=0.0, ambient_gap=0.0,
+            ambient_heard=8, ambient_sticker_p=0.0, ambient_own_p=0.0,
+        )
+        base.update(overrides)
+        self.channel.config = QQConfig(**base)
+        self.channel.files = self.app.characters.pack(base["character"])
+        self.channel._night = pack_file.night_rule(self.channel.files)
+        self.channel._tease = tease_file.tease_rule(self.channel.files)
+
+    def at(self, *args) -> datetime:
+        """把她的钟钉在日本时间的这一刻。"""
+        when = datetime(*args, tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc)
+        self.channel._clock = lambda: when
+        return when
+
+    def test_she_is_never_asleep_when_sleep_is_off(self):
+        """她 20:00 睡：开着的时候睡着，关掉之后同一个钟点是醒的。"""
+        self.her(sleep=False)
+        self.assertFalse(self.channel.sleeping)
+        self.assertFalse(self.channel.resting(self.at(2026, 10, 28, 21, 40)))
+        self.assertFalse(self.channel.resting(self.at(2026, 10, 29, 3, 0)))
+        self.her()  # 只把开关拨回去，同一夜、同一个钟
+        self.assertTrue(self.channel.sleeping)
+        self.assertTrue(self.channel.resting(self.at(2026, 10, 28, 21, 40)))
+
+    def test_no_dice_is_rolled_when_sleep_is_off(self):
+        """作息关着就不掷「今晚熬几小时」：睡眠账本里不该多出一行。"""
+        # 周五 23:30：明天是周六，这一夜要掷「熬几小时」。
+        self.her(sleep=False)
+        self.at(2026, 10, 30, 23, 30)
+        self.channel.resting()
+        self.assertIsNone(self.channel._flag("sleep:young:2026-10-30"))
+        self.her()
+        self.channel.resting()
+        self.assertIsNotNone(self.channel._flag("sleep:young:2026-10-30"), "开着就照掷")
+
+    def test_one_character_can_have_no_schedule(self):
+        """她自己的文件写 `enabled = false`：只关她一个，成年的那位照睡。"""
+        night = self.root / "characters" / "packs" / "young" / "voice" / "night.toml"
+        body = night.read_text(encoding="utf-8")
+        self.addCleanup(lambda: night.write_text(body, encoding="utf-8"))
+        night.write_text(body.replace("[rest]", "[rest]\nenabled = false"), encoding="utf-8")
+        self.her()
+        self.assertFalse(self.channel.sleeping)
+        self.assertFalse(self.channel.resting(self.at(2026, 10, 28, 21, 40)))
+        self.her(character="test")
+        self.assertTrue(self.channel.sleeping, "没写那份文件的那位照睡")
+
+    def test_the_env_switch_wins_over_hers(self):
+        """`.env` 关掉之后她文件里写什么都不作数：那是「整个部署都不睡」，不是「听她的」。"""
+        night = self.root / "characters" / "packs" / "young" / "voice" / "night.toml"
+        body = night.read_text(encoding="utf-8")
+        self.addCleanup(lambda: night.write_text(body, encoding="utf-8"))
+        night.write_text(body.replace("[rest]", "[rest]\nenabled = true"), encoding="utf-8")
+        self.her(sleep=False)
+        self.assertEqual(self.channel._night.enabled, 1, "她自己那份写的是「睡」")
+        self.assertFalse(self.channel.sleeping, "还是要听 `.env` 的")
+
+    async def test_being_woken_is_not_a_thing_when_sleep_is_off(self):
+        """关掉之后深夜那条 @ 就是普通一条：不问「这一轮要不要回」。"""
+        self.her(sleep=False)
+        self.at(2026, 10, 28, 21, 40)
+        seen: dict = {}
+        original = self.channel._night_visit
+
+        def spy(*args, **kwargs):
+            seen["called"] = True
+            return original(*args, **kwargs)
+
+        self.channel._night_visit = spy
+        await self.say(event("ねえねえ", qq="43", message_id="n1", at="999"))
+        self.assertNotIn("called", seen, "没睡着就不需要问「要不要回」")
+        self.assertTrue(self.client.texts, "她照回")
 
 
 class TestQuoteMarks(ChannelCase):

@@ -969,7 +969,7 @@ qq: 看了一眼群里，没接（没什么可接的）
 | `_alive` | 300s | 无 | `get_login_info` 比对 `QQ_SELF_ID`，掉登录时打日志 |
 | `_faces` | 20s 首次 → 24h（失败 300s 后重试） | 无 | 拉这个号收藏的表情进表情包 |
 | `_floor` | 300s | `affinity` 表 | 把主人的好感度抬回下限（§下面） |
-| `_love` | 300s 看一眼 | `qq_flags: love:next` / `love:last` | 恋爱中主动私聊（随机间隔 60~150 分钟） |
+| `_love` | 300s 看一眼 | `qq_flags: love:next` / `love:last` | 主动私聊（随机间隔 60~150 分钟；恋爱只改说什么） |
 | `_idle` | 60s | 无 | 群里安静够久时她自己开口（默认关） |
 | `_digest` | 90s 首次 → 3600s | `qq_digest` 水位 | 到期就重写记忆文件 |
 | `_qzone` | 60s | `qq_flags: qzone:*` | 到点且掷中才发说说（没连上不算一次发布） |
@@ -1093,7 +1093,9 @@ send_qzone_msg {content, images[], ugc_right, target_uins[]} → {tid}
 delete_qzone_msg {tid}
 ```
 
-`ugc_right`：1 所有人 / 4 好友（默认） / 16 部分好友 / 64 仅自己 / 128 部分好友不可见。
+`ugc_right`：1 所有人（默认） / 4 好友 / 16 部分好友 / 64 仅自己 / 128 部分好友不可见。
+默认公开，因为 `voice/qzone.md` 的写作口径就写着「同事、粉丝、不熟的人都会刷到」；
+要收窄就在 `QQ_QZONE_RIGHT` 明写 4。
 **没有只读接口**——不能「先问能不能发」，只能靠第一次失败来发现，
 所以 `unsupported` 会被记 24 小时而不是每分钟重试。
 
@@ -1704,7 +1706,7 @@ python3 serve.py --fake --port 8100
 | `QQ_QZONE` | 0 | 要不要自己发说说 |
 | `QQ_QZONE_HOUR` | 21 | 几点之后可能发 |
 | `QQ_QZONE_P` | 0.35 | 到点后今天写不写的概率（一天只掷一次） |
-| `QQ_QZONE_RIGHT` | 4 | 1 所有人 / 4 好友 / 16 部分 / 64 自己 / 128 部分不可见 |
+| `QQ_QZONE_RIGHT` | 1 | 1 所有人 / 4 好友 / 16 部分 / 64 自己 / 128 部分不可见（默认所有人） |
 | `QQ_QZONE_GAP` | 20 | 两条之间至少隔几小时 |
 | `QQ_DIGEST` | 1 | 要不要写记忆文件 |
 | `QQ_DIGEST_DM_DAYS` / `_GROUP_DAYS` | 3 / 7 | 多久重写一次 |
@@ -1718,7 +1720,7 @@ python3 serve.py --fake --port 8100
 | `QQ_OWNER_LOVE` | 0 | 进入恋爱的门槛（建议 95，比「亲密」的 85 高）。0 = 不启用 |
 | `QQ_OWNER_LOVE_TURNS` | 20 | 还要说过这么多次话（两道门缺一不可） |
 | `QQ_OWNER_LOVE_FLOOR` | 0 | 恋爱中的地板。**0 = 没有地板**（这样才能真的不高兴、才可能生闷气） |
-| `QQ_OWNER_LOVE_PING` | 0 | 恋爱后会不会先发消息（只在私聊） |
+| `QQ_OWNER_LOVE_PING` | 1 | 私聊开着时她会不会先发消息（恋爱只改内容；设 0 = 只回话、不主动） |
 | `QQ_OWNER_LOVE_PING_MIN` / `_MAX` | 60 / 150 | 两条之间的随机间隔（分钟） |
 | `QQ_COMMANDS` | owner | `owner` = 只有主人能用管理指令；`all` = 谁都能用 |
 | `QQ_WORLD` / `QQ_META` / `QQ_BRACKET` | 1 | 三层知识里各开哪一层 |

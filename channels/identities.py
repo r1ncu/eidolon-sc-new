@@ -116,6 +116,17 @@ class Identities:
         row = self._store.query("SELECT muted FROM qq_identities WHERE qq_id = ?", (str(qq_id),))
         return bool(row[0]["muted"]) if row else False
 
+    def card(self, qq_id: str) -> str:
+        """这个号在群里叫什么（最近一次见到的名片）；没说过话的人就是空。
+
+        用在「他圈了谁」上：@ 段里通常只有号码，名字得靠这张表换回来。查不到不算错——
+        一个还没开口的人本来就没有名片，那时候留号码也比把名字删掉强。
+        """
+        row = self._store.query(
+            "SELECT group_card FROM qq_identities WHERE qq_id = ?", (str(qq_id),)
+        )
+        return str(row[0]["group_card"] or "") if row else ""
+
     def set_muted(self, qq_id: str, muted: bool) -> None:
         self._store.execute(
             "UPDATE qq_identities SET muted = ? WHERE qq_id = ?", (1 if muted else 0, str(qq_id))

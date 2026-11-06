@@ -51,6 +51,13 @@ docs/修正方案-*
 local_grown.txt
 # 交叉校验脚本是按这台部署的 28 位角色写的（硬编码了某位角色的 id），只留本地
 tools/crosscheck.py
+# 资料加工脚本读的是本机资料目录、写死这份部署的角色名单，不随内核分发
+tools/build_packs.py
+tools/fill_if_packs.py
+tools/fill_young_packs.py
+tools/make_variants.py
+# 改代码时留的临时副本
+*.py.bak-*
 
 # ---- 4. 缓存与编辑器 ------------------------------------------------------
 __pycache__/

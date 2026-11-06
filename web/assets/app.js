@@ -1,4 +1,4 @@
-﻿/* Localbot-SC 的前端：照着原版（Next.js + Tailwind + shadcn）的结构与样式复刻。
+/* Localbot-SC 的前端：照着原版（Next.js + Tailwind + shadcn）的结构与样式复刻。
  *
  * 复刻的方式：直接用原版编译后的 Tailwind CSS（/assets/css/app.css）与同名 utility class，
  * 所以颜色、字号、圆角、间距和原版天然一致；这里的 JS 只负责画出同样的 DOM 与行为。
@@ -14,478 +14,8 @@
 import { getJSON, postJSON, streamTurn } from "/assets/api.js";
 import { herVars } from "/assets/color.js";
 import { heartIcon, icon, iconFilled } from "/assets/icons.js";
+import { T } from "/assets/i18n.js";
 
-/* ------------------------------------------------------------------ 文案 */
-
-const T = {
-  nav: { conversations: "对话", gifts: "礼物", settings: "设置", label: "导航" },
-  list: {
-    title: "对话",
-    noneSelected: "选一位偶像开始对话",
-    resize: "调整对话列表宽度",
-    search: "搜索名字或组合",
-    noMatch: "没有找到这位偶像",
-    you: (text) => `你：${text}`,
-    photo: "照片：",
-    neverTalked: "还没有对话",
-    nothingSaidYet: "新的对话，还没有说话",
-    yesterday: "昨天",
-    monthDay: (m, d) => `${Number(m)}月${Number(d)}日`,
-    fullDate: (y, m, d) => `${y}/${Number(m)}/${Number(d)}`,
-    loading: "正在载入对话列表",
-    loadFailed: "对话列表没能载入",
-    retry: "重试",
-    pin: "置顶",
-    unpin: "取消置顶",
-    hide: "在列表中隐藏",
-    show: "在列表中显示",
-    pinned: "已置顶",
-    unseen: "有没看过的搭话",
-    filter: "筛选列表",
-    filterHidden: (n) => `筛选列表，已隐藏 ${n} 位`,
-    filterTitle: "列表里显示谁",
-    showAll: "全部显示",
-    noUnit: "其他",
-    hiddenCount: (n) => `已隐藏 ${n} 位`,
-    allHidden: "所有角色都隐藏了",
-    chooseShown: "选择显示谁",
-    announcements: "公告",
-    announcementsUnread: "公告，有未读",
-    noAnnouncements: "还没有公告",
-    announcementsLoading: "正在载入公告",
-    announcementsLoadFailed: "公告没能载入，稍后再试",
-    unreadAnnouncement: "新",
-    pinnedAnnouncement: "置顶",
-    markAnnouncementsRead: "已读",
-    serviceStatus: "服务状态",
-    serviceStatusFailing: "服务状态，有服务不正常",
-    serviceStatusNames: {
-      chat_llm: "对话",
-      memory_llm: "记忆",
-      tts: "语音合成",
-      stt: "语音识别",
-      judge: "判断",
-      embedding: "检索",
-      rerank: "重排",
-      image: "照片",
-    },
-    serviceStatuses: { ok: "正常", unsteady: "不稳定", down: "故障", idle: "最近没有调用" },
-    serviceStatusWindow: (minutes) => `最近 ${minutes} 分钟`,
-  },
-  chat: {
-    back: "返回对话列表",
-    menu: "更多操作",
-    newConversation: "新对话",
-    call: (name) => `和${name}通话`,
-    callTooltip: "语音通话",
-    placeholder: "用中文或日语说点什么",
-    send: "发送",
-    attach: "发送图片或语音",
-    picture: "图片",
-    pictureHint: "选一张图，和她一起看",
-    removePicture: "不发了",
-    attached: (n) => `已选 ${n} 张图片`,
-    today: "今天",
-    messages: "对话内容",
-    emptyTitle: (name) => `和${name}打个招呼吧`,
-    emptyDescription: "打字，或者点右上角的电话和她通话。",
-    emptyDescriptionTyping: "打个字，和她说说话。",
-    replying: (name) => `${name}正在回复`,
-    events: {
-      hung_up: (name) => `${name}挂断了电话`,
-      gift: (name, gift) => `你送给${name}一份${gift}`,
-      ended: (name) => `${name}结束了对话`,
-    },
-    ended: {
-      cooling: (name, until) => `${name}结束了对话。${until} 以后可以再找她`,
-      newConversation: "开个新对话",
-    },
-    past: {
-      open: "历史对话",
-      title: "历史对话",
-      description: (name) => `和${name}的所有对话，最新的在上面。`,
-      onlyCurrent: "开了新对话以后，之前的对话会留在这里。",
-      current: "当前",
-      ended: "她结束了",
-      loading: "正在读取历史对话",
-      loadFailed: "历史对话没能读取",
-      retry: "再试一次",
-      yearMonthDay: (y, m, d) => `${y}年${m}月${d}日`,
-      heading: (day) => `${day}的对话`,
-      opening: "正在打开这段对话",
-      openFailed: "这段对话没能打开",
-      readOnly: "这是你们的历史对话",
-      readOnlyEnded: "这是你们的历史对话，她结束了它",
-      backToCurrent: "回到当前对话",
-      callTooltip: "回到当前对话才能打电话",
-      remove: "删除",
-      removeLabel: (label) => `删除对话：${label}`,
-      removeTitle: (label) => `删除对话「${label}」？`,
-      removeDescription:
-        "这段对话里的消息、通话记录和送礼记录都会彻底删除，无法恢复。她在这段对话里记下的事不受影响，可以在设置的「记忆」里删除。",
-    },
-    photo: {
-      pending: "照片正在生成",
-      sent: "她发来的照片",
-      open: "放大照片",
-    },
-    affinity: {
-      tiers: { cold: "冷淡", distant: "疏远", trust: "信任", close: "亲近", intimate: "亲密" },
-      notes: {
-        cold: "她对你明显冷淡，话很少。",
-        distant: "她有点生气或失望，比平时冷一些。",
-        trust: "你们一直以来的关系。",
-        close: "她比平时更放松，更愿意和你说心里话。",
-        intimate: "她非常信赖你，会说平时不轻易说的心事。",
-      },
-      label: (tier) => `你们的关系：${tier}`,
-      title: (tier) => `你们现在的关系：${tier}`,
-      cooling: (name) => `${name}现在不想说话`,
-      coolingNote: (until) => `${until} 以后可以再找她。送她一件礼物，她会消气得快一些。`,
-      coolingComposer: (name, until) => `${name}现在不想说话。${until} 以后可以再找她`,
-      tiersLabel: "五个档位",
-      rule: "她对你的态度会随你说的话变化。低于「信任」时，不联系也会慢慢回到「信任」。",
-      today: "今天",
-      tomorrow: "明天",
-      cues: {
-        cooldown: (name) => `${name}现在不想说话了`,
-        closer: (name, tier) => `和${name}更近了一步：${tier}`,
-        further: (name, tier) => `${name}和你疏远了一些：${tier}`,
-        happier: (name) => `${name}有点开心`,
-        unhappier: (name) => `${name}有点不高兴`,
-        thawed: (name) => `${name}愿意和你说话了`,
-      },
-    },
-    loadFailed: "读不到这段对话",
-    backToList: "回到对话列表",
-    back: "返回",
-    hearing: "正在说",
-  },
-  settings: {
-    title: "设置",
-    loading: "正在读取…",
-    categories: {
-      profile: "档案",
-      world: "世界观",
-      memories: "记忆",
-      stats: "统计",
-      call: "通话",
-      "reach-outs": "搭话",
-      appearance: "外观",
-      "own-keys": "自带密钥",
-      "sign-in": "登录与数据",
-      "data-package": "数据包",
-      about: "关于",
-    },
-    world: {
-      work: "作品",
-      workNone: "这个部署没有写 work.toml：作品名不会出现在任何提示词里。",
-      workOne: (title, agency) => (agency ? `${title} · ${agency}` : title),
-      workHint:
-        "作品是共享的：标题、事务所、聊到作品本身时的关键词，都只在这一个文件里。换一部作品只改这里。",
-      her: (name) => `${name} 的这一份`,
-      home: (p) => `角色包：${p}`,
-      noHome: "角色包：还没有 packs 目录，全部文件都在旧路径上。",
-      fallback: (list) => `仍在旧路径：${list}`,
-      noFallback: "所有文件都在角色包里。",
-      missing: (list) => `还没写：${list}`,
-      noMissing: "该有的都写好了。",
-      hint:
-        "「世界」是共享的事实；「她怎么看这个世界」只属于她——view.md（怎么看同事）和 world.md（怎么看作品）。两条线一起进提示词：只有事实，她是在念维基；只有看法，她没有站的地方。",
-    },
-    summaries: {
-      worldShare: (n) => `共享 · ${n} 个关键词`,
-      worldNone: "没有 work.toml",
-      addressDefault: "按各自的习惯",
-      profileUnsaved: "有修改未保存",
-      timezoneAuto: (tz) => `自动（${tz}）`,
-      noMemories: "还没有记忆",
-      memories: (n) => `${n} 条`,
-      daysKnown: (n) => `已认识 ${n} 天`,
-      phoneTextureOn: "电话质感开",
-      phoneTextureOff: "电话质感关",
-      scspAvatarsOn: "SCSP 头像开",
-      scspAvatarsOff: "SCSP 头像关",
-      scspBackgroundsOn: "SCSP 聊天背景开",
-      scspBackgroundsOff: "SCSP 聊天背景关",
-      ownKeysNone: "全部用部署者的服务",
-      reachOutsOn: "开",
-      reachOutsOff: "关",
-    },
-    profile: {
-      formOfAddress: "称呼",
-      formOfAddressHint: "角色对你的叫法，只改变叫法，你仍然是她们的制作人。留空时，角色按各自的习惯称呼你。",
-      formOfAddressPlaceholder: "例如：小林さん",
-      gender: "性别",
-      genderHint: "只影响角色现在怎么对待你，不会改写她们回忆中的原作剧情。",
-      genderDefault: "沿用原作设定（男性）",
-      male: "男性",
-      female: "女性",
-      timezone: "时区",
-      timezoneHint: "角色口中的「今天」「今晚」按这个时区计算。自动时使用当前设备检测到的时区。",
-      timezoneAuto: (zone) => `自动（${zone}）`,
-      timezoneUnknown: "当前设备的时区",
-      timezoneSearch: "搜索时区",
-      birthday: "生日",
-      birthdayHint: "生日当天，角色会为你送上祝福。只记月和日。",
-      birthMonth: "月",
-      birthDay: "日",
-      birthdayUnset: "不填",
-      monthOption: (m) => `${m} 月`,
-      dayOption: (d) => `${d} 日`,
-      birthDayMissing: "请补上日期；不想填生日的话，把月份也改成「不填」。",
-      save: "保存档案",
-      saving: "正在保存…",
-      unsaved: "尚未保存",
-      saved: "已保存，所有设备共用这份档案",
-    },
-    appearance: { scspAvatars: "SCSP 头像", scspBackgrounds: "SCSP 聊天背景" },
-    call: {
-      mic: "默认麦克风",
-      micHint: "语音通话默认使用的麦克风。通话中可以在通话层上切换，切换后的会成为新的默认。",
-      micMissing: "已选的麦克风（现在没有连接）",
-      micDefault: "系统默认",
-      micNumbered: (n) => `麦克风 ${n}`,
-      micUnnamed: "浏览器还没有允许本页使用麦克风，因此看不到名称。",
-      micDenied: "没有获得麦克风权限，请在浏览器设置中允许后重试",
-      micAllow: "允许使用麦克风",
-      quality: "通话音质",
-      qualityHint: "角色说话声音的合成音质，越高越清晰，不影响流量。下次接通时生效。",
-      qualities: { low: "普通", standard: "清晰", high: "高保真" },
-      phoneTexture: "电话质感",
-      phoneTextureHint: "让角色的声音像隔着电话听筒。下次接通时生效；开启后，不同通话音质之间的差别会变小。",
-    },
-    ownKeys: {
-      summary:
-        "填了自己的 API key，这一项服务就改用你的额度，费用由你承担。密钥只保存在这台设备的这个浏览器里，换设备、换浏览器或清除浏览器数据后要重新填写。",
-      detailsLabel: "详细说明",
-      details: [
-        "密钥不存到服务器。",
-        "以前填过的也需要重新填一次。",
-        "每次聊天或通话时，密钥随请求发给服务器，只在处理期间使用。",
-        "自带的密钥调用失败时，这一轮会失败并提示是哪一项出了问题，不会改用部署者的密钥；自带的生图失败时这一轮照常，只是照片没发出来。",
-        "自带的视觉识别失败时，这一轮也照常，只是她会说那张图看不清。",
-        "界面上只显示密钥的末 4 位。",
-      ],
-      exemptingNone: "这个部署上，带上自己的服务的通话不计入每小时限额；文字对话带上自己的 LLM 就不计入。",
-      exemptNone: "现在文字对话和语音通话都计入每小时限额。",
-      perCallLimits: "单次通话的时长和轮数上限对所有人都一样。",
-      cannotKeep:
-        "这个浏览器无法保存自带密钥，可能开着隐私模式，或者禁止了网站保存数据。换一个浏览器，或者允许本站保存数据后再填写。",
-      llmTitle: "LLM（扮演角色、记住你说的事）",
-      llmHint: "小模型会降低角色扮演和记忆的质量。模型需要支持流式输出和工具调用，保存前会先试调一次。",
-      ttsTitle: "语音合成（Fish Audio）",
-      ttsModel: "模型",
-      ttsModels: {
-        "s2.1-pro-free": "S2.1 Pro Free（免费）",
-        "s2.1-pro": "S2.1 Pro",
-        "drama-3": "Drama 3",
-        "s2-pro": "S2 Pro",
-        s1: "S1",
-      },
-      sttTitle: "语音识别",
-      sttProvider: "服务商",
-      sttProviders: { soniox: "Soniox", bailian: "阿里云百炼" },
-      imageTitle: "生图（她发来的照片）",
-      imageHint: "填了，她发来的照片用你的额度生成，不计入每小时的照片数。保存前会真生成一张试调。",
-      imageNotSet: "未填写",
-      imageFormat: "接口形式",
-      visionTitle: "视觉识别（看懂你发的图片）",
-      visionHint:
-        "填了，你发来的图片用你的额度描述，不写进对话记录。模型必须支持图片输入，保存前会先让它看一张现做的图。",
-      visionNotSet: "未填写，使用部署者的服务",
-      last4: (last4) => `密钥末 4 位 ${last4}`,
-      notSet: "未填写，使用部署者的服务",
-      protocol: "接口类型",
-      protocols: {
-        "chat-completions": "OpenAI 兼容（Chat Completions）",
-        responses: "OpenAI Responses",
-        anthropic: "Anthropic Messages",
-      },
-      baseUrl: "接口地址（base_url）",
-      model: "模型名",
-      apiKey: "API key",
-      keepApiKey: "留空则沿用现在的密钥。",
-      fill: "填写",
-      edit: "修改",
-      remove: "删除",
-      removeLabel: (service) => `删除${service}的密钥`,
-      save: "试调并保存",
-      saving: "正在试调…",
-    },
-    signIn: {
-      methodsTitle: "登录方式",
-      methodsHint: "绑定另一种登录方式后，用哪一种登录都是你，看到的是同一份记忆。邮箱相同的两个身份也不会自动合并。",
-      signOutTitle: "退出登录",
-      signOut: "退出登录",
-      signOutEverywhere: "退出所有设备",
-      deleteTitle: "删除我的全部数据",
-      deleteHint: "彻底删除你在这里的所有数据，无法恢复。",
-      deleteStart: "删除我的全部数据",
-      deleteConfirmTitle: "删除全部数据？",
-      deleteConfirmHint:
-        "彻底删除你的记忆、对话、制作人档案、登录方式、登录状态和限额的计数，无法恢复，这个浏览器里的自带密钥也一并清除；每天的加密备份里的副本最多 30 天后清除。运行记录会保留到期满 90 天，但不再关联到你。所有设备都会退出登录；之后再用同一种登录方式登录，会是一位全新的用户。",
-      deleteConfirm: "确认删除，无法恢复",
-    },
-    dataPackage: {
-      exportTitle: "导出",
-      exportHint: "把你的数据下载成一个文件，带到这里或别的部署导入。",
-      export: "导出",
-      importTitle: "导入",
-      importHint: "导入的内容并进你现有的数据。",
-      chooseFile: "选择数据包",
-      reading: "正在读取…",
-      import: "导入",
-      importing: "正在导入…",
-      nothingToChoose: "这个数据包里没有能导入的内容。",
-      imported: (counts) => `导入了 ${counts}。`,
-      categories: { conversations: "对话", photos: "照片", memories: "记忆", profile: "制作人档案" },
-    },
-    about: {
-      site: "关于 Localbot-SC",
-      repository: "GitHub 仓库",
-      privacy: "隐私政策",
-      terms: "使用条款",
-      disclaimer: "非官方粉丝作品，与版权方无关；角色由 AI 扮演。",
-    },
-    stats: {
-      empty: "还没有和她们说过话",
-      toConversations: "去对话列表",
-      daysKnown: "已认识",
-      currentVisits: "连续来访",
-      longestVisits: "最长连续",
-      days: "天",
-      portrait: {
-        parts: { night: "深夜", morning: "上午", afternoon: "下午", evening: "晚上" },
-        and: "和",
-        comesAt: (parts) => `常在${parts}来`,
-        anyTime: "什么时段都会来",
-      },
-      heatmap: "过去一年",
-      heatmapLabel: "过去一年每天来的次数",
-      cameOn: (days) => `来过 ${days} 天`,
-      dayCount: (month, day, count) =>
-        count === 0 ? `${month}月${day}日 没来` : `${month}月${day}日 ${count} 次`,
-      month: (month) => `${month}月`,
-      affinity: "好感度",
-      tierMore: (count) => `+${count}`,
-      tierMoreLabel: (count) => `还有 ${count} 位`,
-      tierLess: "收起",
-      rangeLabel: "时间跨度",
-      ranges: { "30d": "近 30 天", "1y": "近一年", all: "全部" },
-      turns: "回合",
-      calls: "通话",
-      callTime: "通话时长",
-      hoursUnit: "小时",
-      minutesUnit: "分",
-      giftsGiven: "送出的礼物",
-      mostTalked: "聊得最多",
-      talked: (turns, days) => `${turns} 个回合 · 认识 ${days} 天`,
-      mostCalled: "通话最久",
-      calledHours: (hours, minutes) => `${hours} 小时 ${minutes} 分`,
-      calledMinutes: (minutes) => `${minutes} 分`,
-      hours: "分时段",
-      hoursLabel: "每个钟点来的次数",
-      hoursTotal: (count) => `共 ${count} 次`,
-      hour: (hour) => `${hour}点`,
-      hourCount: (hour, count) => `${hour}点 ${count} 次`,
-      gifts: "礼物",
-      mostGiven: "送得最多",
-      likedGiven: "她喜欢的",
-      times: (count) => `${count} 次`,
-      timesUnit: "次",
-      /** 分享图（统计页页首末端的「分享」）。 */
-      share: {
-        button: "分享",
-        hint: "把这一页的数据画成一张图，保存下来。",
-        download: "保存图片",
-        failed: "分享图没能生成，请再试一次",
-        producer: "制作人",
-        turnsUnit: "回合",
-      },
-    },
-  },
-  memories: {
-    intro:
-      "角色们在对话中记下的、关于你的事。所有角色共用这些记忆，对一位角色说过的事，其他角色会以转述的口吻知道。标注「私聊」的只会在私聊里被想起，「群聊」的只会在群里被想起，两边互不串。删除后，角色不会再想起这件事。标为「已被取代」的记忆，已经被你后来说的话更新，角色不会再想起；删掉取代它的那条，它就恢复。",
-    loading: "正在读取…",
-    empty: "角色们还没有记下关于你的事。",
-    toldTo: (name) => `对${name}说的`,
-    goneCharacter: "已不在的角色",
-    superseded: "已被取代",
-    surface: (s) => ({ dm: "私聊", group: "群聊", page: "网页" })[s] || "",
-    date: (y, m, d) => `${y}年${m}月${d}日`,
-    remove: "删除",
-    removeLabel: (text) => `删除记忆：${text}`,
-    removeTitle: "删除这条记忆？",
-    removeDescription: (text) => `「${text}」删除后，所有角色都不会再想起这件事，无法恢复。`,
-    clear: "清空全部记忆",
-    clearTitle: "清空全部记忆？",
-    clearDescription: (count) => `确定清空全部 ${count} 条记忆吗？所有角色都会忘记这些事，无法恢复。`,
-    clearConfirm: "确定清空",
-  },
-  affinity: { tiers: { cold: "冷淡", distant: "疏远", trust: "信任", close: "亲近", intimate: "亲密" } },
-  gifts: {
-    title: "礼物",
-    giveHer: "送她一件礼物",
-    closedTitle: "礼物暂时没有开放",
-    closedDescription: "这里还没有开放好感和礼物。已经有的礼物会留着，开放后照常能送。",
-    loading: "正在读取礼物",
-    draw: {
-      title: "抽奖",
-      left: (n) => `还有 ${n} 次`,
-      label: (n, max) => `抽奖还有 ${n} 次，最多攒 ${max} 次`,
-      usual: (next, max) => `${next} 再发 1 次，最多攒 ${max} 次`,
-      full: (max) => `已攒满 ${max} 次，抽掉之前不会再发`,
-      none: (next) => `已经抽完了，${next} 再发 1 次`,
-      once: "抽一次",
-      all: "全部抽完",
-    },
-    drawResult: {
-      one: "抽到了",
-      all: (n) => `抽到 ${n} 样东西`,
-      again: (n) => `再抽一次（还有 ${n} 次）`,
-      give: "送给谁…",
-      keep: "收下",
-      resetName: "重置卡",
-      resetNote: "不是礼物，自己用：把所有低于信任的角色拉回信任，冷却中的马上可以说话。",
-    },
-    reset: {
-      title: "重置卡",
-      count: (n) => `${n} 张`,
-      some: (n) => `现在用会把 ${n} 位拉回信任`,
-      none: "现在没有低于信任的角色，留着以后用。",
-      use: "使用",
-      confirmTitle: "使用一张重置卡？",
-      confirmDescription: "下面几位会回到信任，冷却中的马上可以说话。她们不会知道发生过什么。",
-      confirm: "使用",
-    },
-    rarity: { common: "普通", uncommon: "少见", rare: "稀有" },
-    mine: "我的礼物",
-    filters: { all: "全部", food: "吃的", drink: "饮品", flower: "花草", trinket: "小物件" },
-    held: (name, count, rarity) => `${name}，${count} 件，${rarity}`,
-    count: (n) => `×${n}`,
-    noneOfKind: "这一类还没有礼物",
-    emptyTitle: "还没有礼物",
-    emptyWithDraws: "抽一次，抽到的礼物会放在这里。",
-    emptyWithoutDraws: (next) => `${next} 会发一次抽奖，抽到的礼物会放在这里。`,
-    give: {
-      title: "送她一件礼物",
-      left: (n) => `还有 ${n} 件`,
-      to: "送给谁",
-      cooling: "冷却中",
-      send: (name) => `送给${name}`,
-      choose: "选一位",
-    },
-    given: {
-      stillCooling: (name, until) => `${name}还没消气，${until} 就会愿意说话了`,
-      given: (name) => `已经送给${name}`,
-      toConversation: "去对话",
-    },
-    failed: "这件事没能办成，请再试一次",
-  },
-  common: { back: "返回", close: "关闭", more: "更多", cancel: "取消", notOpen: "这一版还没有开放" },
-};
 
 /* ------------------------------------------------------------------ 状态 */
 
@@ -559,6 +89,48 @@ const el = (html) => {
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+/**
+ * 把所有自绘 select / combobox 的浮层一次性收起。
+ *
+ * 点页面空白、按 Escape、点一个新的触发器时都要做这同一件事——以前这三处各写一份
+ * 同样的三行 `querySelectorAll.forEach`，改一处忘一处的风险很高（Escape 漏关
+ * combobox-content 那种）。收成一份，调用点只说「关」。
+ */
+const closeAllSelects = () => {
+  document.querySelectorAll('[data-slot="select-content"]').forEach((o) => o.classList.add("hidden"));
+  document.querySelectorAll('[data-slot="combobox-content"]').forEach((o) => o.classList.add("hidden"));
+  document.querySelectorAll('[role="combobox"]').forEach((o) => o.setAttribute("aria-expanded", "false"));
+};
+
+/**
+ * 空状态：居中虚线框 + 标题（可选描述、图标、操作）。
+ *
+ * 以前这套 DOM 在公告、列表、对话、统计、记忆、礼物（×2）七处各写一份，class 字符串
+ * 逐字重复。收成一个函数后，class 全部以**字面量**留在源码里（不用 `${变量}` 拼装）——
+ * 这是 `tools/check_classes.py` 能逐个校验的前提：它按 `class="([^"]*)"` 正则提取，
+ * 含 `${` 的 token 会被跳过。两个布尔开关（`heading` / `full`）走 if 分支，让两套
+ * titleClass / 容器 class 都以字面量出现，不靠参数插值。
+ */
+const emptyState = ({ title, description = "", iconHTML = "", content = "", heading = false, full = false }) => {
+  const titleLine = heading
+    ? `<div data-slot="empty-title" class="font-heading text-sm font-medium tracking-tight">${title}</div>`
+    : `<div data-slot="empty-title" class="text-sm font-medium">${title}</div>`;
+  const header = `<div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
+      ${iconHTML ? `<div data-slot="empty-icon" data-variant="icon" class="mb-2 flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground [&_svg:not([class*='size-'])]:size-4">${iconHTML}</div>` : ""}
+      ${titleLine}
+      ${description ? `<div data-slot="empty-description" class="text-sm text-muted-foreground">${description}</div>` : ""}
+      ${content ? `<div data-slot="empty-content" class="flex min-w-0 max-w-sm flex-col items-center gap-2 text-sm text-muted-foreground">${content}</div>` : ""}
+    </div>`;
+  if (full) {
+    return `<div data-slot="empty" class="flex h-full w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
+      ${header}
+    </div>`;
+  }
+  return `<div data-slot="empty" class="flex w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
+    ${header}
+  </div>`;
+};
 
 /** 两个时刻之间：今天写时刻，昨天写「昨天」，今年写月日，更早写年月日。 */
 function listTime(at, now = new Date()) {
@@ -1027,11 +599,7 @@ function announcementsButton() {
         <div class="flex flex-col gap-0.5" data-slot="dialog-header">
           <h2 class="text-lg font-semibold" data-slot="dialog-title">${T.list.announcements}</h2>
         </div>
-        <div data-slot="empty" class="flex w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
-          <div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
-            <div data-slot="empty-title" class="text-sm font-medium">${T.list.noAnnouncements}</div>
-          </div>
-        </div>
+        ${emptyState({ title: T.list.noAnnouncements })}
         <div class="flex flex-row justify-end gap-2" data-slot="dialog-footer">
           <button type="button" data-close="announcements" class="${BUTTON_BASE} h-8 gap-1.5 px-2.5 hover:bg-muted hover:text-foreground">${T.common.close || "关闭"}</button>
           <button type="button" data-close="announcements" class="${BUTTON_BASE} h-8 gap-1.5 px-2.5 bg-primary text-primary-foreground hover:bg-primary/80" disabled>${T.list.markAnnouncementsRead}</button>
@@ -1087,14 +655,10 @@ function conversationList() {
   const showsHidden = !searching && hiddenCount > 0;
   let body;
   if (shown.length === 0 && showsHidden) {
-    body = `<div data-slot="empty" class="flex w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
-      <div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
-        <div data-slot="empty-title" class="text-sm font-medium">${T.list.allHidden}</div>
-      </div>
-      <div data-slot="empty-content" class="flex min-w-0 max-w-sm flex-col items-center gap-2 text-sm text-muted-foreground">
-        <button type="button" id="open-filter-empty" class="${BUTTON_BASE} h-8 gap-1.5 border-border bg-background px-2.5 hover:bg-muted hover:text-foreground">${T.list.chooseShown}</button>
-      </div>
-    </div>`;
+    body = emptyState({
+      title: T.list.allHidden,
+      content: `<button type="button" id="open-filter-empty" class="${BUTTON_BASE} h-8 gap-1.5 border-border bg-background px-2.5 hover:bg-muted hover:text-foreground">${T.list.chooseShown}</button>`,
+    });
   } else if (shown.length === 0) {
     body = `<p class="px-4 py-6 text-center text-preview text-muted-foreground">${T.list.noMatch}</p>`;
   } else {
@@ -1152,12 +716,11 @@ function avatarFor(character) {
 function messageArea(character) {
   const items = state.messages;
   if (items.length === 0) {
-    return `<div data-slot="empty" class="flex h-full w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
-      <div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
-        <div data-slot="empty-title" class="text-sm font-medium">${T.chat.emptyTitle(character.name)}</div>
-        <div data-slot="empty-description" class="text-sm text-muted-foreground">${callEnabled() ? T.chat.emptyDescription : T.chat.emptyDescriptionTyping}</div>
-      </div>
-    </div>`;
+    return emptyState({
+      full: true,
+      title: T.chat.emptyTitle(character.name),
+      description: callEnabled() ? T.chat.emptyDescription : T.chat.emptyDescriptionTyping,
+    });
   }
   const blocks = [];
   let group = null;
@@ -1817,14 +1380,11 @@ function statsBody() {
   if (!stats) return `<p class="text-body text-muted-foreground">${esc(T.settings.loading)}</p>`;
   const shown = statsSections(stats);
   if (shown.isEmpty) {
-    return `<div data-slot="empty" class="flex w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
-      <div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
-        <div data-slot="empty-title" class="font-heading text-sm font-medium tracking-tight">${esc(T.settings.stats.empty)}</div>
-      </div>
-      <div data-slot="empty-content" class="flex min-w-0 max-w-sm flex-col items-center gap-2 text-sm text-muted-foreground">
-        <a href="/conversations" class="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-input bg-background px-2.5 text-sm font-medium whitespace-nowrap transition-all outline-none select-none hover:bg-muted hover:text-foreground">${esc(T.settings.stats.toConversations)}</a>
-      </div>
-    </div>`;
+    return emptyState({
+      heading: true,
+      title: esc(T.settings.stats.empty),
+      content: `<a href="/conversations" class="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-input bg-background px-2.5 text-sm font-medium whitespace-nowrap transition-all outline-none select-none hover:bg-muted hover:text-foreground">${esc(T.settings.stats.toConversations)}</a>`,
+    });
   }
   const t = T.settings.stats;
   const calls = stats.range.calls;
@@ -2174,11 +1734,7 @@ function settingsPanelBody(category) {
               </li>`;
             })
             .join("")}</ul>`
-        : `<div data-slot="empty" class="flex w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
-            <div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
-              <div data-slot="empty-title" class="text-sm font-medium">${T.memories.empty}</div>
-            </div>
-          </div>`;
+        : emptyState({ title: T.memories.empty });
       return `<div class="flex flex-1 flex-col gap-4">
         <p class="${PROSE_WIDTH} text-body text-muted-foreground">${T.memories.intro}</p>
         ${list}
@@ -2541,13 +2097,11 @@ function myGifts() {
 }
 
 function giftEmpty(description) {
-  return `<div data-slot="empty" class="flex w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
-    <div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
-      <div data-slot="empty-icon" data-variant="icon" class="mb-2 flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground [&_svg:not([class*='size-'])]:size-4">${icon("gift")}</div>
-      <div data-slot="empty-title" class="text-sm font-medium">${T.gifts.emptyTitle}</div>
-      <div data-slot="empty-description" class="text-sm text-muted-foreground">${esc(description)}</div>
-    </div>
-  </div>`;
+  return emptyState({
+    iconHTML: icon("gift"),
+    title: T.gifts.emptyTitle,
+    description: esc(description),
+  });
 }
 
 /** 抽奖结果：一层遮罩 + 一张卡，列出抽到的每一样。 */
@@ -2682,13 +2236,11 @@ function giftsPage() {
     </header>`;
   let body = giftEmpty(T.gifts.loading);
   if (closed) {
-    body = `<div data-slot="empty" class="flex w-full min-w-0 flex-1 flex-col items-center justify-center gap-4 rounded-xl border-dashed p-6 text-center text-balance">
-        <div data-slot="empty-header" class="flex max-w-sm flex-col items-center gap-2">
-          <div data-slot="empty-icon" data-variant="icon" class="mb-2 flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground [&_svg:not([class*='size-'])]:size-4">${icon("gift")}</div>
-          <div data-slot="empty-title" class="text-sm font-medium">${T.gifts.closedTitle}</div>
-          <div data-slot="empty-description" class="text-sm text-muted-foreground">${T.gifts.closedDescription}</div>
-        </div>
-      </div>`;
+    body = emptyState({
+      iconHTML: icon("gift"),
+      title: T.gifts.closedTitle,
+      description: T.gifts.closedDescription,
+    });
   } else if (g) {
     body = `${drawDesk()}
         ${g.reset_cards > 0 ? resetStrip() : ""}
@@ -2796,13 +2348,31 @@ function render() {
   }
 }
 
-/** 点浮层外面就收起（原版 Popover/Dialog 的通用行为）。 */
+/**
+ * 点浮层外面就收起（原版 Popover/Dialog 的通用行为）。
+ *
+ * 以前每次调用都 `document.addEventListener("click", …)`，而它在 `wire()` 里被调、
+ * `wire()` 每次 `render()` 都跑——于是每输入一个字、每勾一次选，document 上就多挂
+ * 一个 listener。多挂的 listener 靠 `close()` 内部的 `if (state.filterOpen)` 保护
+ * 没炸，但长会话下 listener 数量一直涨。现在改成：只挂一次 document click，由它
+ * 扫一份注册表；`wire()` 只更新注册表里的 close 回调，不再重复挂 listener。
+ */
+const _outsideClosers = [];
+let _outsideListenerOn = false;
 function outsideClose(wrapId, close) {
+  // 同一个 wrap 只留最新的一份 close（render 重跑时旧的该被替掉，不能叠着留）。
+  const existing = _outsideClosers.find((c) => c.id === wrapId);
+  if (existing) existing.close = close;
+  else _outsideClosers.push({ id: wrapId, close });
+  if (_outsideListenerOn) return;
+  _outsideListenerOn = true;
   document.addEventListener("click", (event) => {
-    const wrap = document.getElementById(wrapId);
-    if (!wrap || wrap.classList.contains("hidden")) return;
-    if (wrap.contains(event.target)) return;
-    close();
+    for (const { id, close } of _outsideClosers) {
+      const wrap = document.getElementById(id);
+      if (!wrap || wrap.classList.contains("hidden")) continue;
+      if (wrap.contains(event.target)) continue;
+      close();
+    }
   });
 }
 
@@ -3348,15 +2918,11 @@ function wire() {
         return;
       }
     }
-    document.querySelectorAll('[data-slot="select-content"]').forEach((other) => other.classList.add("hidden"));
-    document.querySelectorAll('[data-slot="combobox-content"]').forEach((other) => other.classList.add("hidden"));
-    document.querySelectorAll('[role="combobox"]').forEach((other) => other.setAttribute("aria-expanded", "false"));
+    closeAllSelects();
   });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
-    document.querySelectorAll('[data-slot="select-content"]').forEach((other) => other.classList.add("hidden"));
-    document.querySelectorAll('[data-slot="combobox-content"]').forEach((other) => other.classList.add("hidden"));
-    document.querySelectorAll('[role="combobox"]').forEach((other) => other.setAttribute("aria-expanded", "false"));
+    closeAllSelects();
   });
   // 原版 Combobox（时区）：点触发器开浮层，浮层顶上能搜（按文字过滤选项），
   // 点一项选中。搜索框里打字时按方向键、Enter 也照原版那样走（这里只做鼠标的部分）。
@@ -3374,9 +2940,7 @@ function wire() {
     trigger.addEventListener("click", (event) => {
       event.stopPropagation();
       const open = content.classList.contains("hidden");
-      document.querySelectorAll('[data-slot="select-content"]').forEach((other) => other.classList.add("hidden"));
-      document.querySelectorAll('[data-slot="combobox-content"]').forEach((other) => other.classList.add("hidden"));
-      document.querySelectorAll('[role="combobox"]').forEach((other) => other.setAttribute("aria-expanded", "false"));
+      closeAllSelects();
       if (!open) {
         close();
         return;

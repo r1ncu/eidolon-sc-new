@@ -3,7 +3,7 @@
 Everything the page can do is here, and the numbers are upstream's
 (`backend/src/eidolon/gifts.py`, `affinity.py`), because they hold each other in check:
 
-- **One draw chance a day**, as the day begins at midnight Beijing time, kept up to seven.
+- **One draw chance a day**, as the day begins at midnight Tokyo time, kept up to seven.
   Nothing gives them on a schedule: whoever reads them first is given what the days since
   they were last given have brought. A producer without any yet is given one that day.
 - **What a draw gives**, in percent: a reset card 1, a common gift 69, an uncommon 25, a

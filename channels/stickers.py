@@ -69,6 +69,11 @@ class Pack:
         self._rng = rng or random.Random()
         self._max = max_bytes
         self._log = log or (lambda line: None)
+        # qq_flags 的读写以前就在这里一份（`flag`/`set_flag`），现在委托给 `Flags`：
+        # 同一张表的四份实现（Pack / qq.py / plugin_qq.py / web_compat.py）收成一份，
+        # 时间戳和异常处理跟着统一。`Pack.flag` 仍然返 ""（`Flags.require`），保住旧的调用约定。
+        from .flags import Flags
+        self._flags_kv = Flags(store, log=self._log)
 
     def migrations(self) -> Sequence[str]:
         return SCHEMA
@@ -215,15 +220,13 @@ class Pack:
     # ---- the tiny flag store
 
     def flag(self, key: str) -> str:
-        rows = self._store.query("SELECT value FROM qq_flags WHERE key = ?", (key,))
-        return str(rows[0]["value"]) if rows else ""
+        # 委托给 Flags：和 qq.py / plugin_qq.py / web_compat.py 走同一份读写。
+        # 返 ""（不是 None）是 Pack 的旧约定——`plugin_qq.py` 的 `love:next`、
+        # `monday:<week>` 等调度状态都按 "" 判断「没有」，改成 None 会破坏那些 `if not` 分支。
+        return self._flags_kv.require(key)
 
     def set_flag(self, key: str, value: str) -> None:
-        self._store.execute(
-            "INSERT INTO qq_flags (key, value, updated_at) VALUES (?, ?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (key, value, time.strftime("%Y-%m-%dT%H:%M:%S%z")),
-        )
+        self._flags_kv.set(key, value)
 
 
 def _suffix(raw: bytes) -> str | None:

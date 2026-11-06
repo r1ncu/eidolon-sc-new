@@ -54,7 +54,9 @@ REFUSALS = {
 CONVERSATION = re.compile(r"^/api/conversations/([^/]+)$")
 MESSAGES_ = re.compile(r"^/api/conversations/([^/]+)/messages$")
 TURNS_ = re.compile(r"^/api/conversations/([^/]+)/turns$")
-CHARACTER_IMAGE = re.compile(r"^/api/characters/([^/]+)/(avatar|scsp-avatar|background)$")
+CHARACTER_IMAGE = re.compile(
+    r"^/api/characters/([^/]+)/(avatar|scsp-avatar|background|call-background)$"
+)
 CHARACTER_AFFINITY = re.compile(r"^/api/characters/([^/]+)/affinity$")
 CHARACTER_GIFTS = re.compile(r"^/api/characters/([^/]+)/gifts$")
 MEMORY = re.compile(r"^/api/memories/(\d+)$")
@@ -111,11 +113,21 @@ def world_character_json(one: dict) -> dict:
     return {
         "id": one["id"],
         "name": one["name"],
+        # 她是哪一位的另一条人生（`derived_from`）。页面据此把人收进本体那一行，
+        # 而不是平铺成另一位偶像；null 就是她自己。
+        "derived_from": one.get("derived_from") or None,
         "home": pack["home"],
         "ready": pack["ready"],
         "present": pack["present"],
+        # 她自己没写、从本体包里借来的那几份。「齐了」不等于「写全了」，页面要说清楚。
+        "inherited": pack.get("inherited", []),
+        # 必填里她自己还没写的（借来的不算）。空 = 她自己写齐了。
+        "unwritten": pack.get("unwritten", []),
         "missing": [kind for kind in pack["missing"] if kind in REQUIRED],
         "optional": [kind for kind in pack["missing"] if kind not in REQUIRED],
+        # 她在用通道内置默认的那几项（自己没写、也没继承到）。不是错误——功能照常，
+        # 只是「这个 23 点作息是默认，不是她写的」，页面要说清楚。
+        "using_defaults": pack.get("using_defaults", []),
         "fallback": pack["fallback"],
     }
 
@@ -129,11 +141,21 @@ def character_json(character: Any) -> dict:
     return {
         "id": character.id,
         "name": character.name,
+        # 她是哪一位的另一条人生（`characters.toml` 的 `derived_from`）。原版没有这个概念，
+        # 给它 null 就是上游的老行为：一位角色一行，谁也不从属谁。
+        "derived_from": getattr(character, "derived_from", "") or None,
         "intro": character.intro,
         "avatar_url": f"/api/characters/{character.id}/avatar" if character.avatar else None,
         "scsp_avatar_url": f"/api/characters/{character.id}/scsp-avatar" if character.scsp_avatar else None,
         "color": character.color,
         "background_url": f"/api/characters/{character.id}/background" if character.background else None,
+        # 通话层的底图。上游没有这一项，通话层直接铺 background_url；这里多给一个，
+        # 前端优先用它、没有就回退，两边的行为仍然和上游一致。
+        "call_background_url": (
+            f"/api/characters/{character.id}/call-background"
+            if character.call_background
+            else None
+        ),
         "stand": None,
         "idol_id": None,
         "name_zh": character.name_zh or None,
@@ -155,6 +177,13 @@ def make_compat_handler(app: Any) -> type[BaseHTTPRequestHandler]:
     store = app.store
     characters = app.characters
     user_id = app.user_id
+    # qq_flags 的读写：以前这里是第三份实现（`_flag_value`/`_set_flag_value`），和
+    # `qq.py`、`plugin_qq.py`、`stickers.Pack` 各一份且不一致。统一委托给 `Flags`，
+    # 见 `channels/flags.py`。保留 `.strip()`：设置页写 `persona:<偶像>` 时值虽然已 strip，
+    # 读时再 strip 一道是防御性的——换形态那一路拿它去查 `characters.character(...)`，
+    # 多一个空格就 422。
+    from channels.flags import Flags
+    flags = Flags(store)
 
     def character_of(conversation_id: str) -> str | None:
         rows = store.query(
@@ -162,6 +191,47 @@ def make_compat_handler(app: Any) -> type[BaseHTTPRequestHandler]:
             (conversation_id, user_id),
         )
         return str(rows[0]["character_id"]) if rows else None
+
+    def _flag_value(key: str) -> str:
+        return flags.require(key).strip()
+
+    def _set_flag_value(key: str, value: str) -> None:
+        flags.set(key, value)
+
+    def _persona_map() -> dict[str, str]:
+        """每位偶像现在启用的人格。键是偶像 id，值是角色 id；没设过的不出现（= 本体）。"""
+        try:
+            rows = store.query("SELECT key, value FROM qq_flags WHERE key LIKE 'persona:%'")
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for row in rows:
+            key = str(row["key"])
+            value = str(row["value"] or "").strip()
+            if key.startswith("persona:") and value:
+                out[key[len("persona:"):]] = value
+        return out
+
+    def _idol_of(roster: Any, character_id: str) -> str:
+        """这个角色是哪位偶像的某个形态；她自己就是偶像时返回自己。"""
+        if not character_id:
+            return ""
+        try:
+            one = roster.character(character_id)
+        except Exception:
+            return character_id
+        return one.derived_from or character_id
+
+    def _ready(character_id: str) -> tuple[bool, str]:
+        """她能不能演。派生角色继承齐了就放行——读 `inherited_ready`（含继承），不是 `ready`
+        （只认她自己写的）。以前读 `ready`，会把「继承齐了的十岁版」挡在外面。"""
+        try:
+            pack = characters.pack(character_id).compact()
+        except Exception:
+            return True, ""
+        if pack["inherited_ready"]:
+            return True, ""
+        return False, "、".join(pack.get("unwritten") or [])
 
     def qq_channel() -> Any | None:
         """The QQ channel, when this checkout has one. No channel, no plugin to show."""
@@ -407,6 +477,8 @@ def make_compat_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 kind = found.group(2)
                 if kind == "background":
                     image = characters.background(found.group(1))
+                elif kind == "call-background":
+                    image = characters.call_background(found.group(1))
                 else:
                     image = characters.avatar(found.group(1), scsp=kind == "scsp-avatar")
                 if image is None:
@@ -505,6 +577,16 @@ def make_compat_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     }
                 )
                 return
+            if path == "/api/settings/qq-character":
+                # QQ 那边：这个号演**哪位偶像**，以及她此刻是哪个形态。
+                # 两件事分开：偶像归插件页选，形态归设置页「世界观」选（那一份网页也认）。
+                character = app.qq_character()
+                self._json({"character": character, "idol": _idol_of(characters, character)})
+                return
+            if path == "/api/settings/personas":
+                # 设置页「世界观」：每位偶像现在启用哪个形态。没设过的就是本体（不列）。
+                self._json({"personas": _persona_map(), "qq_idol": _flag_value("qq_idol")})
+                return
             if path == "/api/settings/plugins":
                 self._json({"plugins": [plugin_json()]})
                 return
@@ -573,6 +655,62 @@ def make_compat_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     self._json({"error": f"没有这些开关：{'、'.join(unknown)}"}, status=422)
                     return
                 self._json(plugin_json())
+                return
+            if path == "/api/settings/qq-character":
+                # 插件页：这个号演**哪位偶像**。形态不在这里选——那归设置页「世界观」。
+                wanted = str((body or {}).get("idol") or "").strip()
+                if not wanted:
+                    self._json({"error": "要一个偶像 id"}, status=422)
+                    return
+                try:
+                    one = characters.character(wanted)
+                except KeyError:
+                    self._json({"error": f"没有这一位：{wanted}"}, status=422)
+                    return
+                if one.derived_from:
+                    self._json({"error": "这里选偶像；她的形态在设置「世界观」里选"}, status=422)
+                    return
+                # 实际演谁，看她在「世界观」里启用的那个形态。
+                persona = _persona_map().get(wanted) or wanted
+                ok, missing = _ready(persona)
+                if not ok:
+                    self._json({"error": f"{wanted} 启用的那个形态还没写齐：{missing}"}, status=422)
+                    return
+                service = getattr(app, "qq", None)
+                if service is None or getattr(service, "channel", None) is None:
+                    self._json({"error": "这台部署没有 QQ 通道"}, status=404)
+                    return
+                service.switch_idol(wanted)
+                self._json({"idol": wanted, "character": app.qq_character()})
+                return
+            if path == "/api/settings/persona":
+                # 设置页「世界观」：给**某一位偶像**换形态。网页聊天和 QQ 都读这一份。
+                idol = str((body or {}).get("idol") or "").strip()
+                wanted = str((body or {}).get("character") or "").strip() or idol
+                if not idol:
+                    self._json({"error": "要一个偶像 id"}, status=422)
+                    return
+                try:
+                    characters.character(idol)
+                    chosen = characters.character(wanted)
+                except KeyError:
+                    self._json({"error": f"没有这一位：{wanted}"}, status=422)
+                    return
+                if wanted != idol and chosen.derived_from != idol:
+                    self._json({"error": "她不是这一位的形态"}, status=422)
+                    return
+                ok, missing = _ready(wanted)
+                if not ok:
+                    self._json({"error": f"她自己还没写齐：{missing}"}, status=422)
+                    return
+                _set_flag_value(f"persona:{idol}", wanted)
+                # 这个号正好在演这一位，通道要跟着换形态；否则只记下来（网页那边立刻生效）。
+                acting = app.qq_character()
+                if acting and _idol_of(characters, acting) == idol:
+                    service = getattr(app, "qq", None)
+                    if service is not None:
+                        service.restart(wanted)
+                self._json({"idol": idol, "character": wanted})
                 return
             if path == "/api/auth/dev-login":
                 # 原版前端靠这个 cookie 判断「登录过」。值是什么它不看，但必须有。

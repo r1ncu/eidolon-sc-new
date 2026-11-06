@@ -9,7 +9,9 @@ off when its value is empty, which is why there are no "optional feature" flags.
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 DEFAULTS = {
     "SCCORE_HOST": "0.0.0.0",
@@ -194,3 +196,41 @@ def load_env(path: str | Path) -> dict[str, str]:
         os.environ.setdefault(name, value)
         found[name] = value
     return found
+
+
+FIXED_OFFSETS = {"Asia/Tokyo": 9, "Asia/Shanghai": 8, "UTC": 0}
+"""两个不带夏令时的时区，写死偏移。
+
+`ZoneInfo` 要有系统时区库（Linux 有，某些机器上要装 `tzdata`）。装不上时退回这里，
+而不是退回「跑代码的这台机器的时区」—— 后者会让她在开发机上 23:30 醒着、在服务器上
+23:30 睡着，同一个时间两种行为。日本和中国都没有夏令时，写死是准确的。"""
+
+
+def zone(name: str | None) -> Any:
+    """一个时区对象。没有 tzdata 时退回写死偏移（日本 +9，中国 +8，两者都没有夏令时）。
+
+    全仓只有这一份：作息、深夜、主动搭话、记忆文件的时间戳都用它，免得一份对、
+    另一份退成 UTC（差九小时）的不一致。`app.py` 那个处理 None 的版本是给网页端
+    「浏览器时区」用的，逻辑不同，留在那里。
+    """
+    key = name or "UTC"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(key)
+    except Exception:
+        return timezone(timedelta(hours=FIXED_OFFSETS.get(key, 0)))
+
+
+def local_time(now: datetime, tz: str | None) -> datetime:
+    """The same instant, on the clock where she lives."""
+    name = tz or "UTC"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return now.astimezone(ZoneInfo(name))
+    except Exception:
+        hours = FIXED_OFFSETS.get(name)
+        if hours is not None:
+            return now.astimezone(timezone(timedelta(hours=hours)))
+        return now.astimezone()

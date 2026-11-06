@@ -151,9 +151,10 @@ class Memory(Plugin):
         *,
         llm: LLM | None = None,
         names: Callable[[str], str | None] | None = None,
+        kin: Callable[[str, str], bool] | None = None,
         recall: int = RECALL,
         clock: Callable[[], datetime] | None = None,
-        timezone_name: str = "Asia/Shanghai",
+        timezone_name: str = "Asia/Tokyo",
         work: object | None = None,
     ) -> None:
         self._store = store
@@ -171,6 +172,9 @@ class Memory(Plugin):
             self._instructions = _INSTRUCTIONS.replace("{where}", "一位角色")
         self._llm = llm
         self._names = names or (lambda character_id: None)
+        # 两个 id 是不是同一个人（她自己，或者另一个年纪/if 线的她）。记忆是共享的，
+        # 但「十岁的我」不是「别人」——措辞要分开，见 `_memories_prompt`。
+        self._kin = kin or (lambda one, other: one == other)
         self._recall = recall
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._timezone = timezone_name
@@ -213,6 +217,14 @@ class Memory(Plugin):
             when = _date(_parse(memory.at), self._timezone)
             if memory.source_character_id == character_id:
                 lines.append(f"- {memory.text}（{when}，制作人对你说的）")
+            elif self._kin(memory.source_character_id, character_id):
+                # 同一个人、另一条人生。她确实记得，但那是**梦**：没有实感、细节对不上。
+                # 所以这里明说「别当成真发生过」，而不是像下一种那样让她转述。
+                lines.append(
+                    f"- {memory.text}（{when}，像是梦里的事：你记得，但醒来就散了——"
+                    f"时间是模糊的，细节也说不清。被问起就用「不太记得」「好像是」"
+                    f"「梦到过吧」这种说法带过去，不要编具体经过，也不要当成真发生过）"
+                )
             else:
                 name = self._names(memory.source_character_id) or ANOTHER_IDOL
                 lines.append(

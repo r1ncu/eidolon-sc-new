@@ -66,6 +66,7 @@ class TestTheShapes(unittest.TestCase):
             avatar = None
             scsp_avatar = None
             background = None
+            call_background = None
 
         got = character_json(Bare())
         self.assertIsNone(got["avatar_url"])

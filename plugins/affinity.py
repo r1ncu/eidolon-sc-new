@@ -7,12 +7,18 @@ makes them hooks rather than classes.
 The numbers are upstream's, and they hold each other in check, so they are copied whole
 (`backend/src/eidolon/affinity.py`), not invented:
 
+- **A row is (谁, 哪一个她, 在哪儿)**: the person, the *character*, and the surface. The
+  character is resolved to the whole person first — her childhood and her if-line share the
+  base character's number, because a different age is not a different relationship. The
+  surface is not resolved: 「群里的她」 and 「只剩你们两个时的她」 are two numbers.
+
 - **A number from 0 to 100, kept with its fractions.** It recovers 10 a day up to the
   normal value, never falls back from above it, and a turn can raise it by 6 a day at
   most. Users see a tier, never the number.
 - **Five tiers**, from 冷淡 to 亲密, judged on the number as it is.
-- **A cooldown** begins as it falls to 0 and ends as it recovers to 10, so when one ends
-  is known a day at most after it began. While it lasts she does not want to talk.
+- **A cooldown** begins as it falls to 0 and lasts `COOLDOWN_HOURS` at most. While it lasts
+  she does not want to talk. Upstream ended it only when the number recovered to 10 — a full
+  day from zero — and one sentence the judge called out of line took a member out for a night.
 - **The judge moves it, not the model.** The reply's own text never changes the number: a
   model that says "you hurt me" in character is not evidence, and a model that likes being
   flattered would drift upward on its own.
@@ -22,11 +28,11 @@ The numbers are upstream's, and they hold each other in check, so they are copie
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from core.events import PluginEvent
 from core.plugin import Plugin, Question, Route, TurnContext, Veto
 from core.prompt import Section, Slot
+from core.settings import zone as _zone
 from core.store import Store
 
 Tier = str
@@ -48,6 +54,19 @@ NORMAL = 50.0
 
 THAW = 10.0
 """Where a cooldown ends as it recovers: still cold."""
+
+COOLDOWN_HOURS = 4.0
+"""How long a cooldown lasts at most, from the moment it began.
+
+Upstream let it end only when the number climbed back to `THAW`, which from 0 is exactly a
+day — so one sentence judged out of line (a stranger starts at 10, and `OUT_OF_LINE_STEP` is
+-10) took that member out for a full day. From the room it is indistinguishable from 「坏了」,
+and nothing about 「她还在生气」 needs a night to say. Four hours is longer than one evening's
+argument and shorter than a night; a gift still ends it early, because a gift moves the number.
+"""
+
+COOLDOWN_SPAN = timedelta(hours=COOLDOWN_HOURS)
+"""The same as a span, because every use of it is 「now + …」 or 「now - …  >= …」."""
 
 RECOVERY_PER_DAY = 10.0
 """How much it recovers a day below the normal value, evenly."""
@@ -71,10 +90,12 @@ NO_EFFECT = 2
 OUT_OF_LINE_STEP = -10.0
 """How much a turn out of line lowers it, whatever its level."""
 
-DAY_TIMEZONE = "Asia/Shanghai"
-"""The zone whose midnight begins each day for turns' gains: upstream keeps everyone on
-Beijing's days whatever their own zone. 不要跟着 `SCCORE_TIMEZONE` 走——作息和祝日按日本算，
-好感的一天按北京算，这是部署者定的，不是漏改。"""
+DAY_TIMEZONE = "Asia/Tokyo"
+"""The zone whose midnight begins each day for turns' gains.
+
+跟着 `SCCORE_TIMEZONE` 走：她是日本人，作息、祝日、好感的一天都按日本算，同一条日界。
+以前上游按北京结算，现在统一东京——日界从北京 0:00 挪到东京 0:00（即北京 23:00），
+好感度每日上限在北京时间 23 点重置。"""
 
 GAINS_PER_DAY = 6.0
 """How much turns can raise it in a day, in a private chat."""
@@ -277,6 +298,10 @@ class Standing:
     sulk: bool = False
     """「她还在生闷气」. Only a private chat in a relationship ever sets it; every other
     surface keeps it false, and it lifts on its own once the number is back over the line."""
+    since: datetime | None = None
+    """When this cooldown began, when it is known. `at` cannot answer it: `recovered()` stamps
+    the time of the reading, so a cooldown measured from `at` reads 「four hours from now」
+    every time it is read and never ends. Missing means 「it began when the row last moved」."""
 
     def recovered(self, now: datetime, ceiling: float = NORMAL) -> "Standing":
         """Where it drifts back to with nobody talking. `ceiling` is the deployment's
@@ -286,11 +311,16 @@ class Standing:
         if value < ceiling:
             days = max((now - self.at).total_seconds(), 0) / 86400
             value = min(ceiling, value + RECOVERY_PER_DAY * days)
-        return Standing(value, now, self.cooling and value < THAW, self.sulk)
+        cooling = self.cooling and value < THAW and not self.cooled_out(now)
+        return Standing(value, now, cooling, self.sulk, self.since)
+
+    def cooled_out(self, now: datetime) -> bool:
+        """Whether `COOLDOWN_HOURS` have passed since it began."""
+        return now - (self.since or self.at) >= COOLDOWN_SPAN
 
     def stepped(self, step: float) -> "Standing":
         value = min(max(self.value + step, LOWEST), HIGHEST)
-        return Standing(value, self.at, self.cooling or value <= LOWEST, self.sulk)
+        return Standing(value, self.at, self.cooling or value <= LOWEST, self.sulk, self.since)
 
     @property
     def tier(self) -> str:
@@ -300,7 +330,7 @@ class Standing:
     def cooldown_until(self) -> datetime | None:
         if not self.cooling:
             return None
-        return self.at + timedelta(days=(THAW - self.value) / RECOVERY_PER_DAY)
+        return (self.since or self.at) + COOLDOWN_SPAN
 
     def as_dict(self) -> dict[str, object]:
         until = self.cooldown_until
@@ -358,6 +388,7 @@ class Affinity(Plugin):
         clock: Callable[[], datetime] | None = None,
         labels: Callable[[str], str] | None = None,
         work: object | None = None,
+        root: Callable[[str], str] | None = None,
     ) -> None:
         self._store = store
         # 判官读到的第一句原本写死《偶像大师 闪耀色彩》。那是「作品」，从 `works/<id>.toml` 来；
@@ -379,6 +410,22 @@ class Affinity(Plugin):
         member she had never spoken to started out trusted — and heard her private voice."""
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._labels = labels or (lambda character_id: character_id)
+        self._root = root or (lambda character_id: character_id)
+        """「她这个人」的规范 id：派生角色交给本体（`characters.family`）。
+
+        不传就是一对一（老测试、没有角色表的部署）；传了以后本体和她的幼年/if 线共用
+        一行，换个形态不会像换了个人。**只解决角色这一维**——群聊和私聊仍然是两本。
+        """
+
+    def _key(self, character_id: str) -> str:
+        """This row's character: the whole person, not the age she is played at.
+
+        失败退回原 id：一个解析不了的 id 最多是多出一行，不能变成「读不到她的好感」。
+        """
+        try:
+            return self._root(character_id) or character_id
+        except Exception:  # no character table: one row per id, exactly as before
+            return character_id
 
     def capabilities(self) -> dict[str, object]:
         return {
@@ -583,6 +630,7 @@ class Affinity(Plugin):
         somewhere: six in a private chat, ten in a room (see `GAINS_PER_DAY_GROUP`).
         """
         now = self._clock()
+        character_id = self._key(character_id)
         before, gained, gained_on = self._row(user_id, character_id, now, surface)
         today = day_of(now).isoformat()
         gained_today = gained if gained_on == today else 0.0
@@ -595,7 +643,7 @@ class Affinity(Plugin):
         kept_sulk = before.sulk if sulk is None else sulk
         if after.value >= SULK_LINE:
             kept_sulk = False
-        after = Standing(after.value, after.at, after.cooling, kept_sulk)
+        after = Standing(after.value, after.at, after.cooling, kept_sulk, after.since)
         change = None
         if after.value != before.value:
             change = {
@@ -617,8 +665,14 @@ class Affinity(Plugin):
         self, user_id: str, character_id: str, rarity: str, liked: bool, *, surface: str = ""
     ) -> tuple[dict[str, object] | None, Standing]:
         """Raise it for a gift, as a gift record is written; returns what changed (None for
-        nothing to show) and the standing after."""
+        nothing to show) and the standing after.
+
+        A gift written during a cooldown restamps the row, so the four hours are counted from
+        the gift instead of the sentence that caused them. It also raises the number by three,
+        and four gifts end the cooldown outright — the worst case is bounded by
+        `COOLDOWN_HOURS`, and it is the page talking, not the room."""
         now = self._clock()
+        character_id = self._key(character_id)
         before, _, _ = self._row(user_id, character_id, now, surface)
         after = before.stepped(gift_step(rarity, liked, before.cooling))
         # A gift is not a conversation: it can lift her back over the line and end a sulk,
@@ -628,6 +682,7 @@ class Affinity(Plugin):
             now,
             after.cooling and after.value < THAW,
             before.sulk and after.value < SULK_LINE,
+            before.since,
         )
         thawed = before.cooling and not after.cooling
         change = None
@@ -653,6 +708,7 @@ class Affinity(Plugin):
         now = self._clock()
         brought: list[str] = []
         for character_id in character_ids:
+            character_id = self._key(character_id)
             standing, _, _ = self._row(user_id, character_id, now, surface)
             if standing.tier not in BELOW_TRUST:
                 continue
@@ -665,7 +721,7 @@ class Affinity(Plugin):
     # ---- what the page reads
 
     def read(self, user_id: str, character_id: str, *, surface: str = "") -> Standing:
-        return self._row(user_id, character_id, self._clock(), surface)[0]
+        return self._row(user_id, self._key(character_id), self._clock(), surface)[0]
 
     def standing(self, user_id: str, character_id: str, *, surface: str = "") -> Standing:
         """Kept for the page and the stats: the standing now."""
@@ -679,6 +735,7 @@ class Affinity(Plugin):
     ) -> datetime | None:
         """When this row last moved. `Standing.at` cannot answer it — `recovered()` stamps
         the reading time — and the channel needs the real one to leave a hurt alone."""
+        character_id = self._key(character_id)
         scene = self._scene(surface)
         if scene:
             rows = self._store.query(
@@ -763,6 +820,7 @@ class Affinity(Plugin):
         """Put it at a chosen value. The channel's floor is the only caller: a product
         decision applied after the judge, never a way for a turn to move it."""
         now = self._clock()
+        character_id = self._key(character_id)
         kept = Standing(min(max(float(value), LOWEST), HIGHEST), now, False)
         # A floor that lifts her back over the line also ends the sulk; one that does not,
         # leaves it alone.
@@ -778,6 +836,7 @@ class Affinity(Plugin):
     ) -> None:
         """Start or end a sulk without moving the number: the channel's `/哄` and tests."""
         now = self._clock()
+        character_id = self._key(character_id)
         standing = self._row(user_id, character_id, now, surface)[0]
         self._write(
             surface, user_id, character_id, standing.value, now, standing.cooling,
@@ -804,12 +863,17 @@ class Affinity(Plugin):
         if not rows:
             return Standing(self._base(surface), now), 0.0, None
         row = rows[0]
+        at = _parse(row["updated_at"]) or now
+        cooling = bool(row["cooling"])
         kept = Standing(
             float(row["value"]),
-            _parse(row["updated_at"]) or now,
-            bool(row["cooling"]),
+            at,
+            cooling,
             # The page's table has no column for it: only the two chat scenes can sulk.
             bool(row["sulk"]) if "sulk" in row.keys() else False,
+            # The row's own timestamp is the cooldown's start: nothing writes while it lasts
+            # (a turn is vetoed), so `updated_at` is still the moment the number hit zero.
+            at if cooling else None,
         )
         return kept.recovered(now, self._base(surface)), float(row["gained_today"] or 0.0), row["gained_on"]
 
@@ -819,20 +883,13 @@ class Affinity(Plugin):
 
 
 def day_of(now: datetime) -> date:
-    """The day it is for the day's gains: Beijing's, whatever the user's own zone."""
-    try:
-        zone = ZoneInfo(DAY_TIMEZONE)
-    except (ZoneInfoNotFoundError, ValueError):  # a machine without tzdata
-        zone = timezone(timedelta(hours=8))
-    return now.astimezone(zone).date()
+    """The day it is for the day's gains: Tokyo's, whatever the server's own zone."""
+    return now.astimezone(_zone(DAY_TIMEZONE)).date()
 
 
 def next_day(now: datetime) -> datetime:
     """When the day after the one it is at `now` begins, in UTC."""
-    try:
-        zone = ZoneInfo(DAY_TIMEZONE)
-    except (ZoneInfoNotFoundError, ValueError):
-        zone = timezone(timedelta(hours=8))
+    zone = _zone(DAY_TIMEZONE)
     begins = datetime.combine(day_of(now) + timedelta(days=1), datetime.min.time(), zone)
     return begins.astimezone(timezone.utc)
 

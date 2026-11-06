@@ -145,6 +145,9 @@ def make_handler(app: App, page: bytes, extra_routes: dict | None = None) -> typ
             if path.startswith("/media/background/"):
                 self._background(path[len("/media/background/") :].split("?")[0])
                 return
+            if path.startswith("/media/call-background/"):
+                self._call_background(path[len("/media/call-background/") :].split("?")[0])
+                return
             if path.startswith("/media/"):
                 self._photo(path[len("/media/") :])
                 return
@@ -277,6 +280,14 @@ def make_handler(app: App, page: bytes, extra_routes: dict | None = None) -> typ
             path = characters.background(character_id)
             if path is None:
                 self._json({"error": "没有聊天背景"}, status=404)
+                return
+            self._file(path, cache="public, max-age=86400")
+
+        def _call_background(self, character_id: str) -> None:
+            """通话层的底图。没单独配就退回她的聊天壁纸（上游就是这个行为）。"""
+            path = characters.call_art(character_id)
+            if path is None:
+                self._json({"error": "没有通话背景"}, status=404)
                 return
             self._file(path, cache="public, max-age=86400")
 

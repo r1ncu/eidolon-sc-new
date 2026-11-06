@@ -73,6 +73,10 @@ class Character:
     scsp_avatar: Path | None = None
     background: Path | None = None
     """对话页的壁纸（SCSP 那张）；没有就是没有，页面自己退成印象色。"""
+    call_background: Path | None = None
+    """通话层单独用的底图。上游没有这个字段，通话层直接铺 `background`；
+    这里留一个，是为了让「聊天用 SCSP 那张、通话用另一张」成为可能。
+    没配时各处一律回退 `background`（见 `call_art`），行为和上游一致。"""
     voice_id: str = ""
     name_kana: str = ""
     name_romaji: str = ""
@@ -111,6 +115,14 @@ class Character:
     A 5 is 「把你照顾得无微不至」 or 「两小时没回就发十条」 depending on who she is; that
     difference is written in her own file, not here."""
 
+    derived_from: str = ""
+    """She is another age of a character that already exists（`derived_from = "luna"`）。
+
+    **另一个人，不是同一份数据的另一个皮肤。** 好感、睡眠账本、记忆目录都以自己的 id 分开
+    存放；全局那些「给主角色的」设定不套在她身上——`QQ_OWNER_AFFINITY` 的地板、`tease`
+    （夹子）、`tiers`（营业声线）都属于成年那条线，派生角色一条都不继承。规则写在
+    `channels/qq.py`，这里只记「她是从谁来的」。"""
+
     def brief(self) -> dict[str, object]:
         return {
             "id": self.id,
@@ -123,10 +135,12 @@ class Character:
             "avatar": bool(self.avatar),
             "scsp_avatar": bool(self.scsp_avatar),
             "background": bool(self.background),
+            "call_background": bool(self.call_background),
             "unit": self.unit,
             "unit_reading": self.unit_reading,
             "unit_order": self.unit_order,
             "work": self.work,
+            "derived_from": self.derived_from,
         }
 
 
@@ -164,6 +178,21 @@ class Characters(Plugin):
             character.id: pack_file.Pack(self._root, character.id, self._work_of(character))
             for character in self._all
         }
+        # 派生角色（`derived_from`）：自己的包里没写的文件从本体那一份拿。
+        # 这样加一个 if 线只要写差异（人设/语气里不一样的那几行），不用复制一整套。
+        for character in self._all:
+            parent = character.derived_from
+            if not parent or parent not in self._packs:
+                continue
+            mine = self._packs[character.id]
+            self._packs[character.id] = pack_file.Pack(
+                self._root,
+                character.id,
+                mine.work,
+                declared=mine.declared,
+                inherit=self._packs[parent].home,
+                inherit_id=parent,
+            )
         self._adopt_packs()
 
     @property
@@ -202,6 +231,9 @@ class Characters(Plugin):
                 sheet=self._packs[character.id].text("persona") or character.sheet,
                 # 壁纸也先看角色包：`packs/<id>/assets/background.*` 赢过表里的路径。
                 background=self._packs[character.id].path("background") or character.background,
+                call_background=(
+                    self._packs[character.id].path("call-background") or character.call_background
+                ),
             )
             for character in self._all
         )
@@ -286,6 +318,65 @@ class Characters(Plugin):
         character = self._by_id.get(character_id)
         return character.background if character else None
 
+    def call_background(self, character_id: str) -> Path | None:
+        """The call layer's own backdrop, or None when she does not have one."""
+        character = self._by_id.get(character_id)
+        return character.call_background if character else None
+
+    def call_art(self, character_id: str) -> Path | None:
+        """What the call layer actually lays down: her call backdrop, else her chat wallpaper.
+
+        One place for the fallback, so the page and the interface cannot disagree about
+        which picture a call shows."""
+        return self.call_background(character_id) or self.background(character_id)
+
+    def same_person(self, one: str, other: str) -> bool:
+        """这两个 id 是不是同一个人：她自己，或者她的另一个版本（`derived_from` 互相指向）。
+
+        记忆是按 id 分开写的，但「十岁的她」和「十九岁的她」是同一个人——她读到自己
+        另一条人生的记忆时，不该被当成「听别人说的」。
+        """
+        if one == other:
+            return True
+        here, there = self._by_id.get(one), self._by_id.get(other)
+        if here is None or there is None:
+            return False
+        return here.derived_from == other or there.derived_from == one
+
+    def family(self, character_id: str) -> str:
+        """她的好感记在谁名下：本体，还是她自己。
+
+        同一个人的几个形态（`derived_from`）共用一本账——换个年纪不等于换一段关系，
+        「十岁的她」不该从零开始认识他。所以派生角色记到本体名下，本体记在自己名下。
+        链子（A 派生自 B、B 又派生自 C）一路按到底，遇到环就停在原处，不会转圈。
+
+        这是**好感**的规矩，不是记忆的：记忆按 id 分开写（`same_person` 只用来判断
+        「另一条人生的话是梦，不是听别人说的」）。两者故意不一样，别合并。
+        """
+        seen: set[str] = set()
+        current = str(character_id or "")
+        while current and current not in seen:
+            seen.add(current)
+            above = str(getattr(self._by_id.get(current), "derived_from", "") or "")
+            if not above:
+                return current
+            current = above
+        return str(character_id or "")
+
+    def other_versions(self, character_id: str) -> tuple[Character, ...]:
+        """她的其他版本：她派生出来的那些，加上她所派生的那一位。
+
+        写进人设的那条规则只跟「有没有另一个自己」有关，跟是本体还是分支无关。
+        """
+        character = self._by_id.get(character_id)
+        if character is None:
+            return ()
+        found = [one for one in self._all if one.derived_from == character_id]
+        parent = self._by_id.get(character.derived_from) if character.derived_from else None
+        if parent is not None and parent.derived_from != character_id:
+            found.append(parent)
+        return tuple(found)
+
     def name_of(self, character_id: str) -> str | None:
         """Her display name, or None for an identifier this deployment does not know —
         what a memory told to a character no longer here is labelled with."""
@@ -333,7 +424,13 @@ class Characters(Plugin):
                     # 分组的键就是页面用的 id：没写 work 时是空串，写错了就是那个 id。
                     "id": work_id,
                     "characters": [
-                        {"id": one.id, "name": one.name, "pack": self.pack(one.id).compact()}
+                        {
+                            "id": one.id,
+                            "name": one.name,
+                            # 她是哪一位的另一条人生；页面照这个把人收进本体那一行。
+                            "derived_from": one.derived_from or None,
+                            "pack": self.pack(one.id).compact(),
+                        }
                         for one in members
                     ],
                 }
@@ -411,6 +508,7 @@ def _from_entry(
     avatar = _path(root, entry.get("avatar"))
     scsp = _path(root, entry.get("scsp_avatar"))
     wallpaper = _path(root, entry.get("background"))
+    call_wallpaper = _path(root, entry.get("call_background"))
     character_id = str(entry["id"])
     unit, reading, order = _unit_of(character_id, units)
     return Character(
@@ -425,6 +523,9 @@ def _from_entry(
         avatar=avatar if avatar and avatar.exists() else None,
         scsp_avatar=scsp if scsp and scsp.exists() else None,
         background=wallpaper if wallpaper and wallpaper.exists() else None,
+        call_background=(
+            call_wallpaper if call_wallpaper and call_wallpaper.exists() else None
+        ),
         voice_id=str(entry.get("voice_id") or ""),
         work=str(entry.get("work") or "").strip() or work_id,
         unit=unit,
@@ -435,6 +536,7 @@ def _from_entry(
         age=_int_or_none(entry.get("age")),
         plove=_level(entry.get("plove"), 3, low=0, high=5),
         heavy=_level(entry.get("heavy"), 3, low=1, high=5),
+        derived_from=str(entry.get("derived_from") or "").strip(),
     )
 
 

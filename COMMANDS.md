@@ -138,7 +138,7 @@ scbot-new 的 QQ 通道。指令都是发给「ふゆ」那个号（`QQ_SELF_ID`
 | 拒绝话术 | 额度用完、冷却中、太长了 | 私聊和群聊是两套说法 |
 | 好感度分开记 | 群里一条、私聊一条、网页一条，互不影响；`/好感` 读当前这一条 | — |
 | 进入恋爱 | 私聊里好感度 ≥ 95 且说过 20 次话（只算你和她的私聊） | `QQ_OWNER_LOVE` / `QQ_OWNER_LOVE_TURNS` |
-| 她先发消息 | 恋爱之后，间隔随机（90–240 分钟），只在 9:00–23:00 | `QQ_OWNER_LOVE_PING` |
+| 她先发消息 | 私聊开着就会（恋爱只改说什么，不是门槛），间隔随机（60–150 分钟），只在 9:00–23:00 | 网页「私聊」/ `QQ_OWNER_LOVE_PING` |
 | 写私聊的记忆 | 每 3 天一次，重写成 `characters/memory/dm-<QQ号>.md` | `QQ_DIGEST` / `QQ_DIGEST_DM_DAYS` |
 | 写群聊的记忆 | 每周一次，重写成 `characters/memory/group-<群号>.md` | `QQ_DIGEST_GROUP_DAYS` |
 | 记忆进提示词 | 写好的那份会在私聊/群聊各自的对话里被读到 | `QQ_DIGEST_PROMPT`（默认开） |

@@ -16,7 +16,6 @@
 
 import argparse
 import hashlib
-import re
 import shutil
 import sys
 import tarfile

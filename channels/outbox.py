@@ -49,6 +49,13 @@ working, where a second column would have meant a migration on a live database."
 Call = Callable[..., Awaitable[dict[str, Any]]]
 """`await call("send_group_msg", group_id=..., message=[...])` — the OneBot client's shape."""
 
+Keep = Callable[[str, str], None]
+"""`keep(message_id, text)` — remember what went out under which platform id.
+
+QQ answers a send with an id, and that id is the only thing a later 「引用」 carries: the
+quote segment says *which* message, not what it said. Without this the channel can read a
+reply to her words and still have no idea what her words were."""
+
 
 class Outbox:
     def __init__(
@@ -61,6 +68,7 @@ class Outbox:
         retries: int = 2,
         resume_gap: float = 3.0,
         log: Callable[[str], None] | None = None,
+        keep: Keep | None = None,
     ) -> None:
         self._store = store
         self._call = call
@@ -69,12 +77,22 @@ class Outbox:
         self._retries = retries
         self._resume_gap = resume_gap
         self._log = log or (lambda line: None)
+        self._keep = keep
         self._last = 0.0
         self.sent = 0
         self.failed = 0
 
     def migrations(self) -> Sequence[str]:
         return SCHEMA
+
+    def keep(self, fn: Keep | None) -> None:
+        """Who hears about the ids from here on.
+
+        Set after construction as well as in it, because a channel can be handed an Outbox
+        somebody else built (the QQ plugin does exactly that) — and an id nobody wrote down
+        is a «引用» that arrives as 「一条你没看到的消息」.
+        """
+        self._keep = fn
 
     async def send(
         self,
@@ -101,7 +119,7 @@ class Outbox:
             row_id = self._add(group_id, chunk, at, quote, private) if persist else 0
             await self._pace()
             try:
-                await self._deliver(group_id, chunk, at, quote, private)
+                delivered = await self._deliver(group_id, chunk, at, quote, private)
             except Exception as exc:
                 self.failed += 1
                 if row_id:
@@ -110,6 +128,10 @@ class Outbox:
                     )
                 self._log(f"outbox: send failed ({type(exc).__name__}: {exc})")
                 continue
+            if delivered and self._keep is not None:
+                # Before the queue row is dropped: from here on this sentence is quotable,
+                # and 「引用」 is the only way she ever hears her own words back.
+                self._keep(delivered, chunk)
             if row_id:
                 self._store.execute("DELETE FROM qq_outbox WHERE id = ?", (row_id,))
             self.sent += 1
@@ -126,7 +148,7 @@ class Outbox:
             await asyncio.sleep(self._resume_gap)
             target, private = _decode(str(row["group_id"]))
             try:
-                await self._deliver(
+                delivered = await self._deliver(
                     target,
                     str(row["body"]),
                     str(row["mention"]),
@@ -138,6 +160,8 @@ class Outbox:
                     "UPDATE qq_outbox SET attempts = attempts + 1 WHERE id = ?", (row["id"],)
                 )
                 continue
+            if delivered and self._keep is not None:
+                self._keep(delivered, str(row["body"]))
             self._store.execute("DELETE FROM qq_outbox WHERE id = ?", (row["id"],))
             done += 1
         if done:
@@ -160,7 +184,8 @@ class Outbox:
 
     async def _deliver(
         self, target: str, text: str, mention: str, reply_to: str, private: bool = False
-    ) -> None:
+    ) -> str:
+        """Send one bubble; returns the platform's id for it, or "" if it answered with none."""
         message: list[dict[str, Any]] = []
         if reply_to:
             message.append({"type": "reply", "data": {"id": reply_to}})
@@ -168,19 +193,19 @@ class Outbox:
             message.append({"type": "at", "data": {"qq": mention}})
             message.append({"type": "text", "data": {"text": " "}})
         message.append({"type": "text", "data": {"text": text}})
-        await self._push(target, message, private)
+        return await self._push(target, message, private)
 
     async def _push(
         self, target: str, message: list[dict[str, Any]], private: bool, *, retries: int | None = None
-    ) -> None:
+    ) -> str:
         last: Exception | None = None
         for attempt in range((self._retries if retries is None else retries) + 1):
             try:
                 if private:
-                    await self._call("send_private_msg", user_id=target, message=message)
+                    data = await self._call("send_private_msg", user_id=target, message=message)
                 else:
-                    await self._call("send_group_msg", group_id=target, message=message)
-                return
+                    data = await self._call("send_group_msg", group_id=target, message=message)
+                return _said_id(data)
             except Exception as exc:
                 last = exc
                 await asyncio.sleep(0.4 * (attempt + 1))
@@ -212,6 +237,24 @@ def _decode(stored: str) -> tuple[str, bool]:
     if stored.startswith(DM):
         return stored[len(DM):], True
     return stored, False
+
+
+def _said_id(data: Any) -> str:
+    """The id a send was filed under, as text.
+
+    OneBot v11 answers `{"message_id": 12345}`; some builds write it as a string, and a
+    server with nothing to say answers `{}` — which is not an error, only an id we do not
+    have. Numbers become text because the id is used as a dictionary key and as a CQ
+    parameter, and 「引用」 gives it to us as text anyway: comparing `123` to `"123"` would
+    silently never match.
+    """
+    if not isinstance(data, dict):
+        return ""
+    for key in ("message_id", "messageId"):
+        value = data.get(key)
+        if value not in (None, "", 0):
+            return str(value)
+    return ""
 
 
 def split(text: str, limit: int = LIMIT) -> list[str]:
@@ -253,15 +296,33 @@ MOST_IN_A_ROW = 3
 somebody mashing one button forty times (it happens) must not cost forty times the tokens."""
 
 
-def plain_text(message: list[dict[str, Any]]) -> str:
-    """The words of an event, with the @-mentions and the reply header dropped — and with
-    every face left behind as something readable in its place.
+def plain_text(
+    message: list[dict[str, Any]],
+    *,
+    self_id: str = "",
+    name_of: Callable[[str], str] | None = None,
+    quote_of: Callable[[str], str] | None = None,
+) -> str:
+    """The words of an event, with the reply header dropped — every face and every @ left
+    behind as something readable in its place.
 
     Faces used to be dropped on the floor, which had two consequences. A message that was
     *only* a face arrived as an empty string and was discarded before it cost anything, so
     somebody who answered her with a sticker got nothing back — which reads as being
     ignored, not as being quiet. And a face in the middle of a sentence vanished, leaving a
     sentence that said less than the person wrote.
+
+    **@-mentions were dropped the same way, and worse.** Somebody wrote 「没关系，有@愛美
+    请客」 and she received 「没关系，有 请客」: not a shorter sentence but an *unanswerable*
+    one — 「请客的是你」 was her best guess, and it was wrong. So an @ of somebody *else*
+    stays in the text as 「@名字」; only the @ of herself is dropped, because that one is the
+    address rather than a word (being called is `mentions`, and the sentence is read without
+    it — 「@ふゆ /好感」 is a command).
+
+    `name_of` turns a QQ number into what that person is called in the room (the channel
+    passes `Identities.card`, which knows the cards it has seen). When nobody knows it yet,
+    the number itself is left behind: 「@123456」 is still a fact — somebody pointed at that
+    person — while a missing name is not.
 
     `face` is a QQ emoji (小黄脸), sent by id; a few of them carry a name in `raw`.
     `mface` is a favourited or store face, and what it carries is a `summary`. Neither is a
@@ -274,6 +335,22 @@ def plain_text(message: list[dict[str, Any]]) -> str:
         data = segment.get("data") or {}
         if kind == "text":
             out.append(str(data.get("text", "")))
+        elif kind == "at":
+            qq = str(data.get("qq") or "")
+            if qq and qq == str(self_id):
+                continue  # 那是「叫她」，不是她要说的话
+            out.append("@" + _at_name(qq, data, name_of))
+        elif kind == "reply":
+            # 「引用」也是内容，不是排版：有人按着某一条说「这句什么意思」，只收到「这句
+            # 什么意思」的话，她只能猜那句是哪句。引用段只带被引用消息的 id，所以内容得问
+            # `quote_of`（频道去自己记得的那几条里找）。找不到就明说找不到，别让她编。
+            quoted = ""
+            if quote_of is not None:
+                try:
+                    quoted = str(quote_of(str(data.get("id") or "")) or "").strip()
+                except Exception:  # 查不到一条旧消息，不该让整句失败
+                    quoted = ""
+            out.append(f"（引用：「{_shorten(quoted)}」）" if quoted else _UNSEEN_QUOTE)
         elif kind == "face":
             out.append(_face(data))
         elif kind == "mface":
@@ -289,6 +366,40 @@ def _face(data: dict[str, Any]) -> str:
     if named.startswith("表情"):
         named = named[len("表情") :].strip()
     return f"[表情 {named}]" if named else "[表情]"
+
+
+_UNSEEN_QUOTE = "（引用了一条你没看到的消息，不要猜内容）"
+"""引用段只带被引用那条的 id。id 也查不到时，宁可告诉她「没看到」，也不让她补一个出来——
+猜一句别人的话，比不接更糟。"""
+
+
+def _shorten(text: str, limit: int = 60) -> str:
+    line = " ".join((text or "").split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _at_name(
+    qq: str, data: dict[str, Any], name_of: Callable[[str], str] | None = None
+) -> str:
+    """@ 后面那个名字：segment 自带的名字 → 频道见过的名片 → 号码本身。
+
+    三段是有顺序的：NapCat 有时把名字放在 `data.name`，更多时候只给号码；号码要靠
+    `Identities` 的名片去换（那个群里说过话的人才有）。都没有时留号码——「@123456」
+    仍然是一个事实（他圈了这个人），而丢掉名字等于那句句子少一个成分。
+    """
+    if qq == "all":
+        return "全体成员"
+    given = str(data.get("name") or data.get("card") or "").strip()
+    if given:
+        return given
+    if qq and name_of is not None:
+        try:
+            known = str(name_of(qq) or "").strip()
+        except Exception:  # 名片查不到只是少一个名字，不能让整句消息失败
+            known = ""
+        if known:
+            return known
+    return qq or "某人"
 
 
 def _squeeze(text: str) -> str:

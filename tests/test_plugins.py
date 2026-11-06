@@ -19,7 +19,7 @@ from core.plugin import TurnContext
 from core.protocol import Segment
 from core.store import Store
 from plugins import packs
-from plugins.affinity import Affinity
+from plugins.affinity import COOLDOWN_HOURS, NORMAL, THAW, Affinity
 from plugins.characters import Characters
 from plugins.gifts import GiftCatalogError, Gifts
 from plugins.memory import Memory, NewMemory
@@ -192,6 +192,28 @@ class TestAffinity(Base):
         self.affinity = Affinity(self.store, clock=lambda: NOW, labels=lambda c: "真乃")
         self.store.migrate(self.affinity.migrations())
 
+    def test_a_form_and_her_whole_self_share_one_number(self):
+        """本体 / 幼年 / if 线共用一本好感；群聊和私聊仍然是两本。
+
+        2026-11-06 的规矩：「私聊的日花」和「群聊的日花」是两本账，但**本体和她的其他形态
+        是一本**——换个年纪不该像换了个人。
+        """
+        whole = Affinity(
+            self.store, clock=lambda: NOW, labels=lambda c: "真乃",
+            root=lambda cid: "mano" if cid.startswith("mano") else cid,
+        )
+        whole.set_value("u1", "mano_young", 88.0, surface="group")
+        self.assertEqual(whole.read("u1", "mano", surface="group").value, 88.0)
+        self.assertEqual(whole.read("u1", "mano_if", surface="group").value, 88.0)
+        self.assertEqual(
+            whole.read("u1", "mano", surface="dm").value, NORMAL, "私聊那本没被连着写"
+        )
+        whole.change("u1", "mano", -10, surface="group")
+        self.assertEqual(whole.read("u1", "mano_young", surface="group").value, 78.0)
+        self.assertEqual(
+            whole.read("u1", "mano_if", surface="dm").value, NORMAL, "另一个 surface 还是干净的"
+        )
+
     def test_a_new_producer_starts_at_the_normal_value(self):
         standing = self.affinity.standing("u1", "mano")
         self.assertEqual(standing.value, 50)
@@ -258,7 +280,7 @@ class TestAffinity(Base):
             asyncio.run(self.affinity.after_turn(held))
         self.assertEqual(self.affinity.standing("u1", "mano").value, 56)
 
-    def test_falling_to_zero_begins_a_cooldown_that_thaws_at_ten(self):
+    def test_falling_to_zero_begins_a_cooldown(self):
         import asyncio
 
         for _ in range(5):
@@ -280,6 +302,38 @@ class TestAffinity(Base):
         later = Affinity(self.store, clock=lambda: NOW + timedelta(days=1), labels=lambda c: "真乃")
         self.assertFalse(later.standing("u1", "mano").cooling)
         self.assertIsNone(asyncio.run(later.before_turn(turn())))
+
+    def test_a_cooldown_lasts_four_hours_not_until_the_number_recovers(self):
+        """冷却是四小时的怒气，不是「等到涨回 10 分」。
+
+        从 0 涨回 10 要一整天，而陌生人本来就只有 10 分——一句被判出戏的话能让她一整天不理人，
+        群里看到的就是「坏了」。四小时后她说话，分数该多少还是多少。
+        """
+        import asyncio
+
+        for _ in range(5):
+            held = turn()
+            held.facts["affinity.out_of_line"] = True
+            held.reply = reply()
+            asyncio.run(self.affinity.after_turn(held))
+        self.assertTrue(self.affinity.standing("u1", "mano").cooling)
+
+        veto = asyncio.run(self.affinity.before_turn(turn()))
+        self.assertLessEqual(veto.retry_after, int(COOLDOWN_HOURS * 3600))
+        self.assertGreater(veto.retry_after, int((COOLDOWN_HOURS - 0.1) * 3600))
+
+        # 四小时零一分：还在 0 分附近，但已经能说话了。
+        after = Affinity(
+            self.store, clock=lambda: NOW + timedelta(hours=COOLDOWN_HOURS, minutes=1),
+            labels=lambda c: "真乃",
+        )
+        standing = after.standing("u1", "mano")
+        self.assertFalse(standing.cooling, "四小时到了就结束")
+        self.assertLess(standing.value, THAW, "分数并没有因此涨回解冻线")
+        self.assertIsNone(asyncio.run(after.before_turn(turn())))
+
+        # 再读一次也一样：冷却的起点存在行里，不是每次读都从「现在」重算。
+        self.assertIsNone(asyncio.run(after.before_turn(turn())))
 
     def test_a_failed_turn_moves_nothing(self):
         import asyncio

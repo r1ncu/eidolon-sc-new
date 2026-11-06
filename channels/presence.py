@@ -49,7 +49,7 @@ from typing import Any
 
 from core.live import source
 from core.prompt import Section, Slot
-from plugins.affinity import BELOW_TRUST
+from core.settings import zone as _zone
 from plugins.affinity import label as tier_label
 from plugins.packs import tier_lines
 
@@ -104,6 +104,26 @@ ADDRESSEE[ALONE] = (
     "说你自己的事就好——手头在忙的、今天的天气、刚才想到的东西、突然冒出来的念头。"
     "一句话，像在自言自语。"
 )
+
+ROOM_OF_PRODUCERS = """【群里的人】这个群里没有路人：**每一个人都是这个企划的制作人**——他们玩这个企划、看 LIVE、买 CD、追你们。
+不管谁开口，身份都按制作人对待：不要问「你是谁」「是粉丝吗」，也不要说「你不是我的制作人」。
+你未必认得每一个人，但那是「认不认得」，不是「他是不是」。
+唯一的例外：那一行如果标着「另一个 bot，不是人」，那就不是制作人，是另一个角色在说话——别把它当成 P，也别顺着它把自己当成它。"""
+"""Who is in the room, as a fact about the room and not about her.
+
+It goes in the *persona* slot, ahead of the character's own `【场景】`, because a sheet opens
+with 「你正在和你的制作人说话」——one person, with a history——and a rule that arrives after it
+loses to it. Measured on 2026-11-06: a member said 「我不是你的制作人桑吗」 and she answered
+「ちがいますー」.
+
+It lives here, once, instead of in every pack, because it is true of every character on this
+deployment: 28 of them used to carry their own copy of the sentence (and their幼年/if 线 did
+not, so those versions still treated the room as strangers). 「制作人」 is this deployment's
+word for the audience — a work-level noun; a deployment serving two works would move it into
+`works/<id>.toml`.
+
+The exception is the marker `_marks` in `channels/qq.py` puts on a line: 「另一个 bot，不是人」.
+"""
 
 DISTANCE = {
     "called": (
@@ -244,6 +264,16 @@ class Presence:
             return None
         return Section(Slot.PERSONA, found.group(0).strip(), title=f"qq:scene-{scene}")
 
+    def crowd_head(self, scene: str = GROUP) -> Section | None:
+        """谁在这个屋里，作为**屋子**的事实：群里的每一个人都是制作人。
+
+        只给群聊。私聊里「对面是谁」已经由【恋爱】/【叫法】说清楚了，再摆一句「群里每个人
+        都是 P」只会让她在私聊里也端起对外的样子。
+        """
+        if scene != GROUP:
+            return None
+        return Section(Slot.PERSONA, ROOM_OF_PRODUCERS, title="qq:room")
+
     def love_head(self, scene: str = PRIVATE) -> Section | None:
         """「你们已经在谈恋爱」 — persona, like the scene line, and only ever in private.
 
@@ -364,7 +394,7 @@ class Presence:
         *,
         addressee: str,
         now: datetime,
-        timezone: str = "Asia/Shanghai",
+        timezone: str = "Asia/Tokyo",
         bracket: bool = True,
         scene: str = GROUP,
         ambient: bool = False,
@@ -505,26 +535,6 @@ def _clock(now: datetime, timezone_name: str) -> str:
     else:
         part = "深夜"
     return f"{local:%Y-%m-%d %H:%M}（{WEEKDAYS[local.weekday()]} {part}）"
-
-
-def _zone(name: str):
-    """The zone, or as close as this machine can get.
-
-    A Windows box has no tzdata, and `ZoneInfo` then fails — which would put the clock eight
-    hours behind for a deployment that says Asia/Shanghai, and have her say 「おはよう」 at
-    midnight. The fixed offset is the honest fallback for that one case: it is right for the
-    half of the year it is right for, and at least never wrong by a whole day part.
-    """
-    try:
-        from zoneinfo import ZoneInfo
-
-        return ZoneInfo(name)
-    except Exception:
-        if name in ("Asia/Shanghai", "Asia/Chongqing", "Asia/Harbin", "PRC"):
-            from datetime import timedelta, timezone
-
-            return timezone(timedelta(hours=8))
-        return None
 
 
 def _strip(text: str) -> str:

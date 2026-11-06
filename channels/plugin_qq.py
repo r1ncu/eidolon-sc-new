@@ -13,12 +13,14 @@ be written the ordinary async way while `serve.py` stays a threaded HTTP server.
 import asyncio
 import random
 import threading
+from dataclasses import replace
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from core.plugin import Plugin, Route
+from core.settings import zone as _zone
 
 from . import identities as who
 from . import outbox as box
@@ -29,6 +31,7 @@ from . import draw
 from . import qzone_web as web
 from . import romance
 from . import stickers as pack
+from .flags import Flags
 from .config import QQConfig
 from .digest import DM as DIGEST_DM, GROUP as DIGEST_GROUP
 from .onebot import OneBot
@@ -101,6 +104,57 @@ DIGEST_EVERY = 3600.0
 the point: restarting, sleeping, or missing the hour cannot make it skip a cycle."""
 
 
+def _flag(app: Any, key: str) -> str:
+    # 委托给 Flags：和 qq.py / web_compat.py / stickers.Pack 走同一份读写。
+    # 保留 `.strip()`：老实现在这里 strip，写的时候虽然也 strip，但读时再 strip 一道是
+    # 防御性的——`stored_qq` 拿这个值去查 `characters.character(...)`，多一个空格就查不到。
+    return Flags(app.store).require(key).strip()
+
+
+def _set_flag(app: Any, key: str, value: str) -> None:
+    # 委托给 Flags。老实现静默吞异常（`except Exception: pass`），Flags.set 改成 log——
+    # 写不进去至少能在日志里看见，而不是下次重启回到 `.env` 还不知道为什么。
+    Flags(app.store).set(key, value)
+
+
+def persona_key(idol: str) -> str:
+    """这个偶像现在用哪个人格（本体 / if / 幼年）。设置页「世界观」写的，网页和 QQ 共用。"""
+    return f"persona:{idol}"
+
+
+def idol_of(app: Any, character_id: str) -> str:
+    """这个角色是哪位偶像的某个形态；她自己就是偶像时返回自己。"""
+    try:
+        character = app.characters.character(character_id)
+    except Exception:
+        return character_id
+    return character.derived_from or character_id
+
+
+def stored_qq(app: Any) -> tuple[str, str]:
+    """(QQ 上是哪位**偶像**, 她此刻用哪个人格)。
+
+    两件事分开存：`qq_idol` 是「这个号演谁」，`persona:<偶像>` 是「这个人现在是什么形态」。
+    老部署只存过「实际在演的角色」（`character`），这里从它反推一次。
+    """
+    idol = _flag(app, "qq_idol")
+    if idol:
+        return idol, (_flag(app, persona_key(idol)) or "")
+    legacy = _flag(app, "character")
+    if not legacy:
+        return "", ""
+    root = idol_of(app, legacy)
+    return root, (_flag(app, persona_key(root)) or legacy)
+
+
+def remember_qq(app: Any, idol: str, character: str) -> None:
+    """记下「这个号演谁」和「她现在是什么形态」。写不进去只是下次重启回到 `.env`。"""
+    _set_flag(app, "qq_idol", idol)
+    _set_flag(app, persona_key(idol), character)
+    # 冗余一份「实际在演的角色」：日志和旧代码都还在读它。
+    _set_flag(app, "character", character)
+
+
 class QQService(Plugin):
     name = "qq"
     requires = ("characters", "affinity")
@@ -115,6 +169,12 @@ class QQService(Plugin):
     ) -> None:
         self.app = app
         self.config = config or QQConfig.from_env()
+        # 页面上换过人之后，她的身份在库里；`.env` 那一行只是第一次的起点。
+        # 传了 config（测试、或者别处显式指定）就以它为准，不拿库里的去盖。
+        if config is None:
+            idol, persona = stored_qq(app)
+            if idol:
+                self.config = replace(self.config, character=persona or idol)
         self._log = log or (lambda line: print(line, flush=True))
         self.problem = self.config.reason_off()
         self.client = client or OneBot(self.config.ws, self.config.token, on_log=self._log)
@@ -226,6 +286,9 @@ class QQService(Plugin):
         )
         # 「她怎么称呼对面」只有一份，频道读过的那个 toml 就是它。
         self.owner_name = self.channel.owner_name
+        # 她是别人的另一个年纪吗（`characters.toml` 的 `derived_from`）。读一次就够：
+        # 换角色要重启，而这一条决定的是「哪些循环根本不该挂起来」。
+        self.derived = self.channel.derived
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tasks: list[asyncio.Task] = []
@@ -472,11 +535,49 @@ class QQService(Plugin):
             return {
                 "ok": False,
                 "mode": mode,
-                "why": "她没开口：可能被静音、还没进入恋爱、或者这条通道本身关着（看日志）",
+                "why": "她没开口：可能被静音、私聊那一项关着，或者这个部署把「先发消息」关了（看日志）",
             }
         return {"ok": True, "mode": mode}
 
     # ---- the lifecycle
+
+    def switch_idol(self, idol: str) -> None:
+        """这个号改演另一位偶像。
+
+        QQ 这边选的是**偶像**，不是形态——形态归设置页「世界观」管（那一套同时管着网页聊天）。
+        所以这里只做一次映射：偶像 → 她此刻启用的人格 → 重启。
+        """
+        idol = idol.strip()
+        if not idol:
+            raise ValueError("换偶像要一个 id")
+        character = _flag(self.app, persona_key(idol)) or idol
+        self.restart(character)
+
+    def restart(self, character: str) -> None:
+        """换一个人来演：停掉这一套，按新角色重新装一遍，再起来。
+
+        直接重跑 `__init__` 是故意的——她的包、她的空间、那条墙、通道本身都是**构造时**
+        按 `config.character` 解析死的。就地改一个字段只会留下一半旧一半新的人：
+        说新角色的台词、读旧角色的包。重装一遍是唯一不会错的做法。
+
+        同一个人调它什么也不做：页面上的开关点两下，不该让 QQ 断两次。
+        """
+        character = character.strip()
+        if not character:
+            raise ValueError("换角色要一个 id")
+        if character == self.config.character and self._thread is not None:
+            # 内存里已经是她，但**库里不一定**：上一次切过来之后如果容器重建过、
+            # 而那次没写库，就会变成「页面显示开了、重启又变回去」。补一次，幂等。
+            remember_qq(self.app, idol_of(self.app, character), character)
+            return
+        self.stop()
+        remember_qq(self.app, idol_of(self.app, character), character)
+        self.__init__(
+            self.app,
+            replace(self.config, character=character),
+            log=self._log,
+        )
+        self.start()
 
     def start(self) -> None:
         if self.problem:
@@ -499,6 +600,13 @@ class QQService(Plugin):
         # 曾经只能从语气听出来——这一行就是让它一眼看得见。
         self._log(self._pack_report())
         self._log(self._calendar_report())
+        # 她是另一个人的时候要说清楚：**好感不是另一本**（记在本体名下），语气才是分开的。
+        if self.derived:
+            self._log(
+                f"qq: 这是 {self.derived} 的另一个形态（{self.config.character}）——"
+                f"好感记在 {self.derived} 名下，同一个人一本账；记忆、睡眠账本用自己的 id，"
+                f"夹子和档位声线她不继承"
+            )
 
     def _calendar_report(self) -> str:
         """一行：这是哪个国家的日历、覆盖到哪一年、今晚按哪种作息。
@@ -515,15 +623,42 @@ class QQService(Plugin):
         if cal is not None:
             info = cal.as_dict()
             span = f"，表里有 {info['from']}–{info['to']} 共 {info['count']} 天" if info["count"] else "，没有祝日表"
+        # 几点睡是她自己的（角色的 `voice/night.toml`），没写那份文件时才是通道默认的 23 点。
+        # 作息关着（`QQ_SLEEP=0` 或她那份文件写了 `enabled = false`）就不报钟点。
+        if not self.channel.sleeping:
+            return f"作息：关着（{day.isoformat()}，{today}）——她什么时候都在{span}"
+        sleep_h, wake_h = self.channel._rest_hours()
+        late = self.channel._late_max()
         return (
             f"作息：{day.isoformat()}（{'周末' if day.weekday() >= 5 else '工作日'}，{today}"
             + (f"·{note}" if note else "")
-            + f"）/ 明天要上班就 {qq.REST_HOURS[0]}:00 睡，不上班就掷 0–{qq.MAX_LATE_HOURS} 小时"
+            + f"）/ 明天要上班就 {sleep_h}:00 睡，不上班就掷 0–{late} 小时"
+            f"（{wake_h}:00 醒）"
             f"{span}"
         )
 
+    def _hours_note(self) -> str:
+        """她那一觉的钟点，写进启动日志。来自她自己的 `night.toml`，没写就走通道默认。
+
+        作息关着的时候说关着：那时候报几个钟点是假的，读日志的人会照着它去猜她为什么不
+        搭话。"""
+        if not self.channel.sleeping:
+            return "作息关着（她什么时候都在，钟点不拦任何一条）"
+        sleep_h, wake_h = self.channel._rest_hours()
+        late = self.channel._late_max()
+        latest = (sleep_h + late) % 24
+        return (
+            f"工作日 {sleep_h}:00–{wake_h}:00；第二天不上班时 {sleep_h}:00 "
+            f"+ 掷到的 0–{late} 小时（最晚 {latest:02d}:00）–{wake_h}:00。日本时间"
+        )
+
     def _pack_report(self) -> str:
-        """一行：这个角色的包在哪、哪几份还在旧路径、哪几份根本没写。"""
+        """一行：这个角色的包在哪、哪几份还在旧路径、哪几份根本没写。
+
+        `using_defaults` 单列一段：那几项是她自己没写、也没继承到，通道静默用内置默认
+        顶上的（`night` 的 23 点作息、`refusals` 的朴素拒答词、`interests` 的中性话题）。
+        以前只能从语气里猜「这个作息是不是她写的」，现在日志里一眼看得见。
+        """
         try:
             pack = self.app.characters.pack(self.config.character)
         except Exception:
@@ -538,6 +673,8 @@ class QQService(Plugin):
             parts.append("旧路径：" + "、".join(ready["fallback"]))
         if ready["missing"]:
             parts.append("未写：" + "、".join(ready["missing"]))
+        if ready.get("using_defaults"):
+            parts.append("用默认：" + "、".join(ready["using_defaults"]))
         return " / ".join(parts)
 
     def stop(self) -> None:
@@ -581,6 +718,16 @@ class QQService(Plugin):
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _serve(self) -> None:
+        self._start()
+        await self.client.run(self.channel.on_event, on_connect=self._reconnected)
+
+    def _start(self) -> None:
+        """挂起定时任务，并把「这一台部署到底开了什么」打印出来。
+
+        单独一个方法是因为**那几行日志就是部署者唯一的说明书**：哪条循环没挂、几点睡、
+        谁的好感有地板，全靠启动那十几行。测试直接调这一段（不去连 OneBot），所以
+        「日志说的和实际做的一致」这件事是可以断言的，而不是只能靠人读。
+        """
         self.pack.prune()
         # Not here: a replay attempted before the socket is up fails every row and spends
         # its retry budget (`attempts < 5`). It belongs on the connect, which also covers
@@ -614,6 +761,7 @@ class QQService(Plugin):
         ):
             # Checked on a schedule, not only at start: the judge can lower him mid-day, and
             # the point of the floor is that he never *sees* the tier below it.
+            # 派生形态也挂：好感是按她这个人记的（本体那一本），换形态不能让地板失效。
             self._spawn(self._floor())
             # Two floors now, and either may be off: the one before they are together, and
             # the one after. Saying only the first would be a lie half the time.
@@ -622,27 +770,34 @@ class QQService(Plugin):
                 if self.config.owner_love_floor > 0
                 else "恋爱里没有地板（低于 70 时说错话会让她生闷气）"
             )
+            whose = f"{self.owner_name}的好感度"
+            if self.derived:
+                whose += f"（记在 {self.derived} 名下，现在演的是另一个形态）"
             self._log(
-                f"qq: {self.owner_name}的好感度恋爱前不低于 {self.config.owner_affinity:g}，{warm}"
+                f"qq: {whose}恋爱前不低于 {self.config.owner_affinity:g}，{warm}"
             )
-        if self.config.owner_love > 0 and self.config.owners:
+        if self.config.owner_love > 0 and self.config.owners and not self.derived:
             # 她等太久会自己开口。开关跟恋爱系统同一个：`QQ_OWNER_LOVE=0` 表示这个部署
             # 不要恋爱这条线，那她也没什么可说的。
+            # 派生角色（幼年版）连这个循环都不挂：那句话是主角色才有的，她没有这条线。
             self._spawn(self._she())
             self._log(
                 f"qq: 好感在 {romance.SHE_FLOOR:g} 以上待满 {romance.SHE_DAYS} 天、他还不说，"
                 f"她可能自己开口（每天一次）"
             )
-        if self.config.love_ping and self.config.owners:
-            # Only fires once they are actually together; the random gap is the feature.
+        if self.config.owners:
+            # 开关是**私聊那一项**（`may_direct`），所以这条循环一直挂着：网页上拨一下，
+            # 五分钟内就生效。以前这里看 `love_ping`——那是启动时读的 `.env`，页面上拨不动，
+            # 于是「私聊开着」和「她会先发消息」是两件事，部署者只看得见前一件。
             self._spawn(self._love())
+            open_now = "开着" if self.channel.config.private else "关着"
+            hours = self._hours_note()
+            # 作息开着才说「只在作息时段」；关着的时候那半句是假的。
+            when = f"只在作息时段——{hours}" if self.channel.sleeping else hours
             self._log(
-                f"qq: 恋爱之后她会先发消息（间隔 {self.config.love_ping_min:g}–"
-                f"{self.config.love_ping_max:g} 分钟，只在作息时段——工作日 "
-                f"{qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00；第二天不上班时 {qq.REST_HOURS[0]}:00 "
-                f"+ 掷到的 0–{qq.MAX_LATE_HOURS} 小时（最晚 "
-                f"{qq.REST_HOURS[0] + qq.MAX_LATE_HOURS - 24}:00）–{qq.REST_HOURS[1]}:00。"
-                f"日本时间）"
+                f"qq: 她会先发消息（开关＝私聊那一项，现在{open_now}；恋爱只改说什么；间隔 "
+                f"{self.config.love_ping_min:g}–"
+                f"{self.config.love_ping_max:g} 分钟，{when}"
             )
         if self.config.ambient and self.config.ambient_idle > 0 and self.config.groups:
             # Off by default: a bot that starts talking into a quiet room is the feature most
@@ -651,9 +806,7 @@ class QQService(Plugin):
             self._spawn(self._idle())
             self._log(
                 f"qq: 安静 {int(self.config.ambient_idle)} 分钟以上时，她可能自己开口"
-                f"（工作日 {qq.REST_HOURS[0]}:00–{qq.REST_HOURS[1]}:00；第二天不上班的晚上 23:00 "
-                f"掷骰子，熬 0–{qq.MAX_LATE_HOURS} 小时，最晚 "
-                f"{qq.REST_HOURS[0] + qq.MAX_LATE_HOURS - 24}:00；有人 @ 她照回）"
+                f"（{self._hours_note().rstrip('。日本时间')}；有人 @ 她照回）"
             )
         if self.config.image:
             # 说清楚是哪一种：假画家出的东西是一块纯色，不是照片。
@@ -699,7 +852,6 @@ class QQService(Plugin):
                 f"{self.config.qzone_reply_age:g} 小时以内、最近 "
                 f"{self.config.qzone_reply_posts} 条说说下的"
             )
-        await self.client.run(self.channel.on_event, on_connect=self._reconnected)
 
     # ---- one thing happens on a schedule
 
@@ -941,9 +1093,19 @@ class QQService(Plugin):
                 if step == "draw":
                     self._love_draw(now)
                     continue
-                for qq_id in self.config.owners:
-                    await self.channel.love_ping(qq_id)
-                self.pack.set_flag(LOVE_LAST, f"{now.timestamp():.0f}")
+                open_rooms = [
+                    one for one in self.config.owners if self.channel.config.may_direct(one)
+                ]
+                if not open_rooms:
+                    # 私聊关着（或者名单里没人）：这一轮什么都不做。**不记「已发」**，
+                    # 也不画下一个间隔——那颗定时炸弹留着，开关一开下一轮就发得出去。
+                    await asyncio.sleep(LOVE_TICK)
+                    continue
+                sent = False
+                for qq_id in open_rooms:
+                    sent = await self.channel.love_ping(qq_id) or sent
+                if sent:
+                    self.pack.set_flag(LOVE_LAST, f"{now.timestamp():.0f}")
                 self._love_draw(datetime.now(_zone(self.app.settings.timezone)))
             except Exception as exc:  # a failed message must not stop the next one
                 self._log(f"qq: 主动私聊失败（{type(exc).__name__}: {exc}）")
@@ -1167,15 +1329,6 @@ def _until(hour: int, now: datetime) -> float:
     if target <= now:
         target += timedelta(days=1)
     return (target - now).total_seconds() + random.uniform(0, 600)
-
-
-def _zone(name: str):
-    try:
-        from zoneinfo import ZoneInfo
-
-        return ZoneInfo(name)
-    except Exception:
-        return timezone.utc
 
 
 def _now() -> str:

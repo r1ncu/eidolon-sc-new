@@ -20,6 +20,7 @@ from typing import Any, Callable, Sequence
 
 from core.llm import ChatMessage
 from core.prompt import Section, Slot
+from core.settings import zone as _zone
 
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS qq_digest ("
@@ -83,7 +84,7 @@ class Digest:
         *,
         clock: Callable[[], datetime] | None = None,
         log: Callable[[str], None] | None = None,
-        timezone_name: str = "Asia/Shanghai",
+        timezone_name: str = "Asia/Tokyo",
         self_name: str = "",
         owner_name: str = "",
         her_names: Sequence[str] = (),
@@ -371,15 +372,6 @@ def _write_atomic(target: Path, page: str) -> None:
 
 def _safe(key: str) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", str(key)).strip("_") or "x"
-
-
-def _zone(name: str = "Asia/Shanghai"):
-    try:
-        from zoneinfo import ZoneInfo
-
-        return ZoneInfo(name)
-    except Exception:  # no tzdata: UTC is wrong by hours, but it is still a date
-        return timezone.utc
 
 
 def _parse(raw: Any) -> datetime | None:

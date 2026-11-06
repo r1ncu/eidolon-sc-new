@@ -56,6 +56,13 @@ class QQConfig:
     merge_seconds: float = 1.2
     member_cooldown: float = 20.0
     concurrency: int = 2
+    sleep: bool = True
+    """她有没有作息。`QQ_SLEEP=0` = 关：不睡觉、不掷骰子、不记睡眠账本、被 @ 也不会有
+    「被吵醒」那一段语气。
+
+    关掉的是**整套作息**，不只是「晚上不闭嘴」——`resting()` 一律回答 False，所以主动
+    搭话、主动私聊、深夜轮数上限全部不再受钟点约束。想只挪钟点别关它，去写角色包里的
+    `voice/night.toml`。"""
     ambient: bool = False
     ambient_p: float = 1.0
     """每条群消息有多大比例会被「认真看一眼」——这是一道成本闸，不是「说不说」的骰子。
@@ -124,8 +131,16 @@ class QQConfig:
     以前默认 90：恋爱里也压着，不让掉出「亲密」。现在改成没有地板——恋爱里的人也必须
     能真的不高兴，`Affinity` 的「生闷气」（低于 70 又被戳一下）才有机会发生。想恢复
     旧行为就把它设回 90。恋爱前那条 `owner_affinity` 不受影响。"""
-    love_ping: bool = False
-    """恋爱之后，她会不会不定时地先发消息过来（只在私聊里）。"""
+    love_ping: bool = True
+    """她会不会不定时地先发消息过来（只在私聊里）。
+
+    **不是恋爱开关**：还没在一起她也会先开口（工作、天气、嫌他昨天没回），恋爱只决定这条
+    消息说什么、用什么口气。要不要主动，跟**私聊开关**是一件事——私聊关着一条也发不出去
+    （`may_direct` 在拦），开着就由这个字段说了算，只留给「私聊开着、但别主动找我」时设 0。
+
+    以前默认 0：私聊开了还得再开一个 `.env` 才理人，两个开关守同一件事，而网页上只看得到
+    前一个（私聊），于是拨了私聊却什么也没发生。
+    """
     love_ping_min: float = 60.0
     love_ping_max: float = 150.0
     """两条主动消息之间的随机间隔（分钟）。真正的开关是随机：不固定时间、不固定条数。"""
@@ -141,9 +156,10 @@ class QQConfig:
     """几点之后可以发。过了这个点才轮到骰子，不是「九点整准时发」。"""
     qzone_p: float = 0.35
     """过了点之后，今天到底写不写的概率。一天只掷一次并记下来：按分钟掷的话，35% 到早上就成了必然。"""
-    qzone_right: int = 4
+    qzone_right: int = 1
     """谁能看见：1 所有人、4 好友、16 部分好友、64 仅自己、128 部分好友不可见。
-    默认 4——她的日记属于好友列表，不属于所有搜得到这个号的人。"""
+    默认 1——`voice/qzone.md` 那份写作口径就写着「空间是公开的：同事、粉丝、不熟的人都会刷到」，
+    可见范围却设成好友可见的话，她是照着一个不存在的观众在写。也和 NapCat 自己的缺省一致。"""
     qzone_gap: float = 20.0
     """两条之间至少隔多少小时。只写「一天一条」的话，23:50 和 00:10 会被算成两天。"""
     qzone_web: bool = True
@@ -228,6 +244,7 @@ class QQConfig:
             merge_seconds=_float(env, "QQ_MERGE_SECONDS", 1.2),
             member_cooldown=_float(env, "QQ_MEMBER_COOLDOWN", 20.0),
             concurrency=_int(env, "QQ_GROUP_CONCURRENCY", 2),
+            sleep=_flag(env, "QQ_SLEEP", True),
             ambient=_flag(env, "QQ_AMBIENT", False),
             ambient_p=_float(env, "QQ_AMBIENT_P", 1.0),
             ambient_gap=_float(env, "QQ_AMBIENT_GAP", 240.0),
@@ -251,7 +268,7 @@ class QQConfig:
             owner_love=_float(env, "QQ_OWNER_LOVE", 0.0),
             owner_love_turns=_int(env, "QQ_OWNER_LOVE_TURNS", 20),
             owner_love_floor=_float(env, "QQ_OWNER_LOVE_FLOOR", 0.0),
-            love_ping=_flag(env, "QQ_OWNER_LOVE_PING", False),
+            love_ping=_flag(env, "QQ_OWNER_LOVE_PING", True),
             love_ping_min=_float(env, "QQ_OWNER_LOVE_PING_MIN", 60.0),
             love_ping_max=_float(env, "QQ_OWNER_LOVE_PING_MAX", 150.0),
             monday_hour=_int(env, "QQ_MONDAY_HOUR", 9),
@@ -259,7 +276,7 @@ class QQConfig:
             qzone=_flag(env, "QQ_QZONE", False),
             qzone_hour=_int(env, "QQ_QZONE_HOUR", 21),
             qzone_p=_float(env, "QQ_QZONE_P", 0.35),
-            qzone_right=_int(env, "QQ_QZONE_RIGHT", 4),
+            qzone_right=_int(env, "QQ_QZONE_RIGHT", 1),
             qzone_gap=_float(env, "QQ_QZONE_GAP", 20.0),
             qzone_web=_flag(env, "QQ_QZONE_WEB", True),
             qzone_reply=_flag(env, "QQ_QZONE_REPLY", False),
