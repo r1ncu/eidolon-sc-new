@@ -104,13 +104,14 @@ class Base(unittest.TestCase):
         self.llm = ScriptedLLM(GOOD)
 
     def zone(self, *, web=None, hourly=reply.HOURLY, gap=reply.GAP, age=72.0, deny=(), llm=None, on=True,
-             bots=None, owners=()) -> Wall:
+             bots=None, owners=(), full=None) -> Wall:
         return Wall(
             None,
             llm or self.llm,
             self.store,
             web=web or FakeWeb(),
             persona=self.persona,
+            persona_base=full,
             flags=self.flags,
             bots=bots,
             self_id="999",
@@ -582,3 +583,35 @@ class TestTheHourlyWindow(Base):
         web.posts[0]["cmtnum"] = 2
         web.by_post[POST].append(cmt("4", text="第二句。"))
         self.assertEqual(asyncio.run(zone.poll())["replied"], 0)
+
+
+class TestTheWholePersonaInTheComments(Base):
+    """评论也是公开场合：完整人设进得来，但《空间里的她》仍然压在最前。"""
+
+    SHEET = "你是春野澄，在唱片店打过工。私下的那面只给最熟的人看。"
+
+    def prompt_for(self, full) -> str:
+        from core.prompt import Section, Slot
+
+        web = FakeWeb()
+        zone = self.zone(web=web, gap=0.0, full=lambda: (
+            Section(Slot.PERSONA, self.SHEET, title="sample"),
+        ) if full else None)
+        self.first(zone)
+        web.posts[0]["cmtnum"] = 1
+        web.by_post[POST] = [cmt("3", text="嗓子还好吗？")]
+        asyncio.run(zone.poll())
+        return " ".join(str(message.content) for batch in self.llm.seen for message in batch)
+
+    def test_the_character_sheet_is_there_and_the_guide_comes_first(self):
+        text = self.prompt_for(True)
+        self.assertIn(self.SHEET, text)
+        self.assertIn("公开场合", text)
+        self.assertIn("以前面的为准", text)
+        self.assertLess(text.index("空间里的她"), text.index(self.SHEET))
+        self.assertIn("不要写 `<ja><zh>`", text)
+
+    def test_without_an_engine_the_comment_is_still_answered(self):
+        text = self.prompt_for(False)
+        self.assertIn("句子短", text)
+        self.assertNotIn(self.SHEET, text)

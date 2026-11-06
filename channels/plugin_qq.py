@@ -202,12 +202,20 @@ class QQService(Plugin):
         def own(kind: str):
             return files.path(kind) if files is not None else None
 
+        # 空间里也是**这个完整的人**，不只是那份写作口径。取引擎 persona 槽的现场值：
+        # 人设文件热更、或换过角色之后，引擎会重建，这里跟着变，不会留着上一个人的声音。
+        # 只取 persona，不调用 `Engine.build()`——那边会带上 `<ja><zh>` 的对话协议、
+        # 房间和「对面那位制作人」，那些在公开场合都是错的。
+        def full_persona():
+            return app.engines[self.config.character].base
+
         self.qzone = space.Qzone(
             self.client,
             app.llm,
             app.store,
             character=self.config.character,
             persona=own("qzone"),
+            persona_base=full_persona,
             flags=self.pack,
             ugc_right=self.config.qzone_right,
             hour=self.config.qzone_hour,
@@ -231,6 +239,7 @@ class QQService(Plugin):
             app.store,
             web=self.web,
             persona=own("qzone"),
+            persona_base=full_persona,
             flags=self.pack,
             self_id=self.config.self_id,
             # 全局忽略名单也在这里生效：`QQ_IGNORE_IDS` 是「完全不理的号」，一个在群里

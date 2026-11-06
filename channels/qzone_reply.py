@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from core.live import source
+from core.prompt import Section, persona_text
 
 from . import qzone as wall
 
@@ -203,6 +204,7 @@ class Wall:
         web: Any = None,
         persona: str | Path | None = None,
         flags: wall.Flags | None = None,
+        persona_base: Callable[[], Sequence[Section]] | None = None,
         bots: Mapping[str, str] | None = None,
         self_id: str = "",
         deny: Sequence[str] = (),
@@ -220,6 +222,7 @@ class Wall:
         self._store = store
         self._web = web
         self._src = source(persona) if persona else None
+        self._persona_base = persona_base
         self._bots = dict(bots or {})
         """QQ 号 → 那个角色在别的系统里的名字（`QQ_BOTS`）。它们不是制作人，是别的
         角色在说话；认错了，她会用「群里的另一位制作人」的口吻去接一句ルカ的台词。"""
@@ -245,6 +248,16 @@ class Wall:
 
     def persona(self) -> str:
         return self._src.text() if self._src is not None else ""
+
+    def full_persona(self) -> str:
+        """同 `Qzone.full_persona`：读不到就退回写作口径，不让一条评论因为人设缺件卡住。"""
+        if self._persona_base is None:
+            return ""
+        try:
+            return persona_text(self._persona_base())
+        except Exception as exc:
+            self._log(f"qq: 空间评论拿不到完整人设（{type(exc).__name__}: {exc}）")
+            return ""
 
     def recent(self, count: int = 8) -> list[dict[str, Any]]:
         rows = self._store.query(
@@ -496,8 +509,6 @@ class Wall:
 
         who = comment.name or comment.uin or "一个人"
         lines = [
-            self.persona().strip(),
-            "",
             "## 这一次",
             "有人在你的空间里，给你的一条说说留了评论。",
         ]
@@ -521,8 +532,15 @@ class Wall:
             f"只有这三种情况只输出 {SKIP}（四个字母，什么都别加）："
             "低俗或跟性有关的；骂人、人身攻击的；纯粹是复读或报错、没有一句话可接的。"
             "不回也是一种回答，但别把它用在只是嘴上不客气的人身上。",
+            "不要写 `<ja><zh>` 之类的对话标记——这里不是聊天，只回一句话。",
+            "公开场合怎么说话，以最前面那段《空间里的她》为准。",
         ]
-        return [ChatMessage("system", "\n".join(lines))]
+        return [ChatMessage("system", wall.public_system(
+            guide=self.persona().strip(),
+            persona=self.full_persona(),
+            task="\n".join(lines),
+            head=wall.PUBLIC_REPLY_HEAD,
+        ))]
 
     # ---- saying it
 

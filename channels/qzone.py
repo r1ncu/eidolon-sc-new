@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from core.live import source
+from core.prompt import Section, persona_text
 
 POST_LIMIT = 240
 """Characters in one post. Qzone takes two thousand; two thousand is an essay, not a status."""
@@ -61,6 +62,42 @@ RIGHT = {1: "所有人可见", 4: "好友可见", 16: "部分好友可见", 64: 
 """QQ 的 `ugc_right`。默认 1（所有人可见）：`voice/qzone.md` 里那份写作口径是按「外面
 有人在看着」写的，好友可见会让那句前提变成假的；NapCat 不给这个参数时也默认 1。
 改回 4 是部署自己的决定，写进 `QQ_QZONE_RIGHT` 即可。"""
+
+PUBLIC_HEAD = """【现在是公开场合 · 这一段的优先级最高】
+你正在用 QQ 空间发一条说说：同事、同一个企划的人、粉丝、不认识的人都会刷到，相当于现实里的偶像
+在自己账号上发一条动态。没有人问你话，没有人在跟你聊天，也没有「对面那位制作人」。
+紧接着的《空间里的她》写的是**这个场合**的样子；后面那份完整人设是告诉你**你是谁**——名字、经历、
+在乎什么、那种说话方式的来由。它不是在把这里改成私聊。
+两段冲突时**一律以前面的为准**：人设里若写着「你正在和你的制作人说话」「只跟他一个人说」，
+那是聊天时的口径，在空间里不成立；只对一个人讲的私事、家里的事，也不写进公开的说说。"""
+
+PUBLIC_REPLY_HEAD = """【现在是公开场合 · 这一段的优先级最高】
+有人在你 QQ 空间的一条说说下面留了评论，你要公开回一句：同事、粉丝、不认识的人都看得到，
+相当于现实里的偶像在社交媒体的评论区回话。紧接着的《空间里的她》写的是**这个场合**的样子；
+后面那份完整人设是告诉你**你是谁**，不是在把这里改成私聊。
+两段冲突时**一律以前面的为准**：别写成「只跟制作人一个人说话」，也别把只对一个人讲的私事
+搬到评论区。"""
+
+FULL_HEAD = "# 你是谁（完整人设 · 供背景与说话方式的来由）"
+"""放在 qzone 口径之后：位置本身就是优先级，抬头再写一遍免得模型把它当成新的指令层。"""
+
+
+def public_system(guide: str, persona: str, task: str, *, head: str = PUBLIC_HEAD) -> str:
+    """One system message for a public post (or a public reply).
+
+    Order is the design: the 场合口径 comes first and says it wins, the full character
+    follows as *background*, and the job of the moment sits last where it is freshest.
+    Without the full character she is only a writing style; without the guide first she
+    is the private self from the chat prompt, talking to one person in front of everybody.
+    """
+    pieces = [head.strip()]
+    if guide.strip():
+        pieces.append(guide.strip())
+    if persona.strip():
+        pieces.append(FULL_HEAD + "\n\n" + persona.strip())
+    pieces.append(task.strip())
+    return "\n\n".join(pieces)
+
 
 BANNED = ("AI", "ai", "机器人", "模型", "提示词", "prompt", "prompt", "系统消息", "角色扮演", "虚拟主播")
 """Words that mean she has stepped out of character. A 说说 is the one place nothing can
@@ -211,6 +248,7 @@ class Qzone:
         *,
         character: str = "",
         persona: str | Path | None = None,
+        persona_base: Callable[[], Sequence[Section]] | None = None,
         flags: Flags | None = None,
         ugc_right: int = 1,
         hour: int = 21,
@@ -227,6 +265,9 @@ class Qzone:
         self._store = store
         self._chars = character
         self._src = source(persona) if persona else None
+        # 完整人设（引擎的 persona 槽）每次写说说的现场取，不在这里存一份：人设文件被改过、
+        # 或者换过角色之后，缓存住的就是上一个人的声音。`None` 时退回旧的「只有写作口径」。
+        self._persona_base = persona_base
         self._flags = flags or Memory()
         self.right = ugc_right if ugc_right in RIGHT else 1
         self.hour = hour
@@ -245,6 +286,20 @@ class Qzone:
 
     def persona(self) -> str:
         return self._src.text() if self._src is not None else ""
+
+    def full_persona(self) -> str:
+        """The character behind the 口径, or "" when this surface has none to read.
+
+        A missing/broken engine must not cost a post: the writing guide alone was enough
+        for this account for months, and a public post is not worth a stack trace.
+        """
+        if self._persona_base is None:
+            return ""
+        try:
+            return persona_text(self._persona_base())
+        except Exception as exc:
+            self._log(f"qq: 空间拿不到完整人设（{type(exc).__name__}: {exc}）——这一条只按写作口径写")
+            return ""
 
     def recent(self, count: int = RECENT) -> list[Posted]:
         rows = self._store.query(
@@ -411,8 +466,6 @@ class Qzone:
         week = "一二三四五六日"[now.weekday()]
         recent = [one.content for one in self.recent(3) if one.ok]
         lines = [
-            self.persona().strip(),
-            "",
             "## 这一次",
             f"现在是 {now.month} 月 {now.day} 日（周{week}）{now:%H:%M}。",
             "写一条 QQ 空间的说说。没有人问她话，也没有上文——这是她自己空间里的一条。",
@@ -424,8 +477,14 @@ class Qzone:
         lines += [
             f"只输出正文，{POST_FLOOR}～{self.limit} 字，一到三句。",
             "不要引号、不要「说说：」这类标签、不要话题标签、不要解释你在做什么。",
+            "不要写 `<ja><zh>` 之类的对话标记——这里不是聊天，只发一段正文。",
+            "公开场合怎么说话，以最前面那段《空间里的她》为准。",
         ]
-        return [ChatMessage("system", "\n".join(lines))]
+        return [ChatMessage("system", public_system(
+            guide=self.persona().strip(),
+            persona=self.full_persona(),
+            task="\n".join(lines),
+        ))]
 
     # ---- whether it worked
 

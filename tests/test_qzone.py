@@ -90,13 +90,14 @@ class Base(unittest.TestCase):
         self.logs: list[str] = []
 
     def zone(self, *, bot=None, llm=None, chance=1.0, hour=21, gap=20.0, right=1,
-             retry=space.RETRY_GAP) -> Qzone:
+             retry=space.RETRY_GAP, full=None) -> Qzone:
         return Qzone(
             bot or Bot(),
             llm or ScriptedLLM(GOOD),
             self.store,
             character="fuyuko",
             persona=self.persona,
+            persona_base=full,
             flags=self.flags,
             ugc_right=right,
             hour=hour,
@@ -512,6 +513,42 @@ class TestTheShapes(unittest.TestCase):
         with self.assertRaises(ContentError) as caught:
             raise ContentError("太长")
         self.assertEqual(caught.exception.why, "太长")
+
+
+class TestTheWholePersonaInPublic(Base):
+    """空间里仍然是**这个人**，但公开场合的口径压在最前、而且明说了它赢。"""
+
+    SHEET = "你是春野澄，在唱片店打过工。私下的那面只给最熟的人看。"
+
+    def full(self):
+        from core.prompt import Section, Slot
+
+        return lambda: (Section(Slot.PERSONA, self.SHEET, title="sample"),)
+
+    def prompt(self, full):
+        llm = ScriptedLLM(GOOD)
+        asyncio.run(self.zone(llm=llm, full=full).maybe())
+        return str(llm.seen[0][0].content)
+
+    def test_the_character_sheet_is_there_and_the_guide_comes_first(self):
+        text = self.prompt(self.full())
+        self.assertIn(self.SHEET, text, "完整人设要进得来")
+        self.assertIn("公开场合", text, "而且要写明这是公众场合")
+        self.assertIn("以前面的为准", text, "冲突时 qzone 口径优先，得说出口")
+        self.assertLess(text.index("空间里的她"), text.index(self.SHEET),
+                        "qzone 口径排在完整人设之前")
+        self.assertIn("不要写 `<ja><zh>`", text, "不把聊天协议带进说说")
+
+    def test_the_post_still_happens_when_the_engine_cannot_be_read(self):
+        def broken():
+            raise RuntimeError("engine is gone")
+
+        llm = ScriptedLLM(GOOD)
+        result = asyncio.run(self.zone(llm=llm, full=broken).maybe())
+        self.assertTrue(result["posted"], "人设读不到不该让一条说说发不出去")
+        self.assertIn("句子短", str(llm.seen[0][0].content))
+        self.assertNotIn(self.SHEET, str(llm.seen[0][0].content))
+        self.assertTrue(any("拿不到完整人设" in line for line in self.logs))
 
 
 if __name__ == "__main__":

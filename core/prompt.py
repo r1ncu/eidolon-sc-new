@@ -109,6 +109,18 @@ class PromptBuilder:
         return prompt
 
 
+def persona_text(base: Sequence[Section]) -> str:
+    """The cached character sheet on its own, for a surface that is not a conversation.
+
+    A 说说 is not a turn: there is no addressee, no history, and no `<ja><zh>` reply
+    protocol, so calling `build()` would hand it a format it must not use and a fake user
+    message. But it still needs the whole character — sheet, facts, view, names, kin —
+    in the same order a chat turn reads them. Joining here keeps that order in one place:
+    a public post and a chat reply cannot quietly disagree about who she is.
+    """
+    return "\n\n".join(_texts(base, Slot.PERSONA))
+
+
 def _only(sections: Sequence[Section], where: str) -> None:
     for section in sections:
         if section.slot not in (Slot.TURN, Slot.PROFILE):  # `!=`, not `is`: a plugin may hand a plain string
