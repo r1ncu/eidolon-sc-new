@@ -5,16 +5,25 @@
 原因有两个，都不是技术上的：角色设定、立绘、剧情台词是别人的作品，原作方和配音演员的
 权益在里面；而一份写着某个具体角色的人设，也注定只对一个部署者有意义。
 
+> **哪些文件要补、不补会怎样、去哪抄格式**，逐项列在
+> [docs/部署数据清单.md](../docs/部署数据清单.md)。本文讲目录归属与字段含义。
+
 ## 最少要准备什么
 
 ```
 cp characters/characters.example.toml characters/characters.toml
-cp characters/units.example.toml      characters/units.toml     # 可选
-mkdir -p characters/sheets characters/avatars characters/world
-mkdir -p characters/works && cp characters/work.example.toml characters/works/<作品id>.toml  # 可选
+mkdir -p characters/packs/<id>/voice characters/world
+# 写 characters.toml 里那几条，再写 packs/<id>/ 下这三份：
+#   persona.md     人设
+#   voice/qq.md    群聊语域
+#   voice/dm.md    私聊语域
+python tools/check_packs.py <id>       # 必需项齐不齐
+# 可选：units.example.toml → units.toml；work.example.toml → works/<作品id>.toml
 ```
 
-然后写 `characters.toml` 里那几条，`sheet` 指向的人设文件放 `characters/sheets/<id>.md`。
+`characters.toml` 里 `sheet` 指不到包里的 `persona.md` 时，会退回
+`characters/sheets/<id>.md`（旧路径仍读得到）；**新写的角色一律放 `packs/<id>/`**，
+解析顺序是先包后旧路径，两边都写时以包为准。
 没有 `characters.toml` 时，目录里每个 `*.md` 都会被当成一个角色（文件名就是 id）——
 够跑起来，但没有颜色、没有简介。
 
@@ -23,13 +32,16 @@ mkdir -p characters/works && cp characters/work.example.toml characters/works/<�
 | 位置 | 必需 | 作用 |
 |---|---|---|
 | `characters.toml` | **是** | 角色表：id、名字、颜色、人设路径，以及恋爱系统的三个数 |
-| `works/<id>.toml` | 否 | 作品表：标题、事务所、话题词。一个作品一份，**平级**；角色用它区分归属 |
+| `packs/<id>/` | **是（推荐）** | 一个角色一个包：`persona.md` / `voice/{qq,dm}.md` 是三份必需，其余见下面「两条线」 |
+| `works/<作品id>.toml` | 否 | 作品表：标题、事务所、话题词。一个作品一份，**平级**；角色用它区分归属 |
 | `units.toml` | 否 | 组合表，只影响对话列表的分组与搜索候选 |
-| `sheets/<id>.md` | 是 | 人设正文。会进提示词的 persona 槽，按角色缓存 |
-| `avatars/<id>.jpg` | 否 | 头像。没有就是没有，不报错 |
-| `world/<id>-*.md` `world/<id>-*.toml` | 否 | 群聊/私聊的语气、兴趣、话题、拒绝话术等，见 `world/README.md` |
-| `facts/<id>.md` | 否 | 大段背景资料。`SCCORE_RECALL=whole` 时整份进提示词 |
-| `facts/*/` | 否 | 可检索的剧情片段，按 `world/<id>-stories.toml` 的话题命中才注入 |
+| `sheets/<id>.md` | 旧路径 | 人设正文，进提示词的 persona 槽；包里有 `persona.md` 时以包为准 |
+| `avatars/<id>.jpg` | 否 | 头像。没有就是没有，不报错（也可放 `packs/<id>/assets/`） |
+| `world/<id>-*.md` `world/<id>-*.toml` | 旧路径 | 群聊/私聊的语气、兴趣、话题、拒绝话术等；现在放 `packs/<id>/voice/`，见 `world/README.md` |
+| `world/{work,office,meta}.md`、`world/idols/` | 否 | **共享层**：作品事实与名单，一份给所有角色，见 `world/README.md` |
+| `facts/<id>.md` | 旧路径 | 大段背景资料，包里是 `facts.md`。`SCCORE_RECALL=whole` 时整份进提示词 |
+| `facts/*/` | 旧路径 | 可检索的剧情片段，包里是 `facts-stories/`，按 `stories.toml` 的话题命中才注入 |
+| `calendar.toml` | 仓库自带 | 日本祝日表（公开数据，2026–2027），每年更新一次 |
 | `gifts.toml` | 否 | 礼物目录 |
 | `memory/` | 自动生成 | 她自己的记忆文件，**不要提交、不要分享** |
 

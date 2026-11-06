@@ -5,6 +5,10 @@
 >
 > 本文只描述**代码里现在是这样**的东西。设计上的取舍与来龙去脉在 `README.md`；
 > 最短路径的 QQ 单群部署在 `DEPLOY.md`；通道作为独立插件包分发时的说明在 `docs/qq-channel/`。
+> **仓库不含任何角色数据**：clone 之后要补哪些文件、不补会怎样，见
+> [部署数据清单](部署数据清单.md)；本文描述的是代码，不是某台部署上的角色内容。
+> 角色文件一律以 `characters/packs/<id>/` 为主路径；代码仍兼容 `world/<id>-*.md`
+> 这类旧的扁平名，解析时先读包、再退回旧路径（对照表见 `docs/qq-channel/04-自定义角色.md`）。
 
 ---
 
@@ -35,13 +39,13 @@
 
 | 项 | 数值 | 出处 |
 |---|---|---|
-| Python 代码 | 约 21,800 行（其中测试约 8,000 行） | `find . -name '*.py' \| xargs wc -l` |
+| Python 代码 | 约 36,100 行（其中测试约 12,900 行） | `find . -name '*.py' \| xargs wc -l` |
 | 第三方运行时依赖 | **0** | `pyproject.toml` 的 `dependencies = []` |
 | 内核模块 | 12 个文件 + `protocol/` 3 个 | 见 §1.4 |
-| 插件 | 11 个 + 1 个通道 | `plugins/`、`channels/` |
-| 数据表 | 21 张（内核 3 + 插件 11 + 通道 7） | 见 §2.6 |
-| 角色 | 28 位（1 位有完整私有资料） | `characters/characters.toml` |
-| 单元测试 | 765 条 | `python -m unittest discover -s tests -t .` |
+| 插件 / 通道 | 14 个插件文件 + 22 个通道文件 | `plugins/`、`channels/` |
+| 数据表 | 25 张（按各模块 `SCHEMA` 去重） | 见 §2.6 |
+| 角色 | **仓库 0 位**；全部由部署者准备 | `docs/部署数据清单.md` |
+| 单元测试 | 1037 条 | `python -m unittest discover -s tests -t .` |
 | 容器 | 2 个（内核 + NapCat） | `docker-compose.yml` |
 
 三条贯穿全项目的设计纪律，先记住这三条，后面所有设计都是它们的推论：
@@ -146,6 +150,7 @@ QQ 线程    threading.Thread(name="qq", daemon=True)
 scbot-new/
 ├── serve.py                  HTTP 服务入口：路由、SSE、静态文件
 ├── app.py                    组装：Store + Host + 每角色 Engine；网页要的聚合视图
+├── web_compat.py             原版 Next.js 前端的兼容接口（8101，可选）
 ├── demo.py                   不要 key、不启服务，跑两轮看内核怎么工作（教学用）
 ├── Dockerfile / docker-compose.yml / .env.example
 │
@@ -154,6 +159,7 @@ scbot-new/
 │   ├── plugin.py             ★ 插件协议：Veto / Question / TurnContext / Plugin
 │   ├── host.py               ★ 插件调度：排序、隔离、路由合并、能力上报
 │   ├── prompt.py             提示词四槽 + 缓存断点 + 历史裁剪
+│   │                        （`persona_text()`：只取 persona 槽，给 QQ 空间这类「不是回合」的场合）
 │   ├── judge.py              判分总线：一次请求回答多个问题
 │   ├── store.py              SQLite：三张表 + 插件迁移入口
 │   ├── settings.py           环境变量 → Settings（含 .env 读取）
@@ -163,72 +169,68 @@ scbot-new/
 │   ├── messages.py           Conversation / Message 数据结构
 │   └── protocol/             回复格式：解析 <ja>/<zh>、语气提示、照片标记
 │
-├── plugins/                  11 个可开关的功能
-│   ├── characters.py         角色名册与头像
+├── plugins/                  14 个文件；一个角色一套 Engine
+│   ├── characters.py         角色名册、头像、`family()`（派生形态 → 本体）
+│   ├── packs.py            ★ `characters/packs/<id>/` 的包结构与继承白名单 `_LAYOUT`
 │   ├── recall.py             她的资料（off / whole / vector）
 │   ├── stories.py            剧情原文按话题检索
-│   ├── quota.py              每小时回合数
-│   ├── photos.py             图片与每小时额度
-│   ├── affinity.py         ★ 好感度 + 生闷气
+│   ├── quota.py / photos.py  每小时回合数 / 图片与额度
+│   ├── affinity.py         ★ 好感度 + 生闷气（四小时冷却、按人物共账）
+│   ├── tease.py             「夹子」的额度与逐句许可
 │   ├── memory.py             关于制作人的长期记忆
-│   ├── gifts.py              抽签、背包、重置卡
-│   ├── profile.py            制作人档案（称呼/性别/生日/时区）
-│   ├── voice.py              语音合成（Fish Audio）
-│   └── status.py             服务健康（调用成功率）
+│   ├── gifts.py / profile.py / voice.py / status.py
 │
 ├── channels/                 QQ 通道（可以整个拿走，内核照常跑网页版）
 │   ├── plugin_qq.py        ★ 通道即插件：生命周期、路由、定时循环
-│   ├── qq.py               ★ 消息入口、判定、回合、分段发送
+│   ├── qq.py               ★ 消息入口、判定、回合、分段发送（约 3400 行）
 │   ├── config.py             QQ_* 配置
-│   ├── onebot.py             OneBot 11 客户端（重连 + echo 关联）
-│   ├── ws.py                 零依赖 WebSocket 客户端
-│   ├── outbox.py             发送队列：分段、节流、失败补发
-│   ├── presence.py           语域：场景 / 熟悉度档位 / 好感档位
+│   ├── flags.py              `qq_flags` 统一读写：运行时开关、时间戳、None 语义
+│   ├── onebot.py / ws.py     OneBot 11 客户端（重连 + echo 关联）
+│   ├── outbox.py             发送队列：分段、节流、失败补发、`message_id` 带回
+│   ├── presence.py           语域：场景 / 熟悉度档位 / 好感档位 / 群聊房间规则
 │   ├── world.py              三层知识：人名册 / 同事档案 / 作品常识
 │   ├── interests.py          插话判断（含「她认识的同行」）
-│   ├── digest.py             记忆文件：定期整份重写
-│   ├── stickers.py           表情包：收录、打标、挑选
-│   ├── qzone.py             ★ QQ 空间说说（自己的墙）
-│   ├── qzone_feed.py        ★ 别人的说说：拉动态、回评论
+│   ├── digest.py / stickers.py / calendar.py
+│   ├── qzone.py            ★ QQ 空间说说（公开口径 + 完整人设）
+│   ├── qzone_reply.py / qzone_feed.py / qzone_web.py   评论、别人动态、网页接口
 │   ├── identities.py         QQ 号 ↔ 内核用户 + 次数/静音/恋爱标记
-│   ├── stage.py / texts.py   角色自己的措辞与拒绝台词
-│   └── (world/<id>-*.md|toml 在 characters/ 下)
+│   └── stage.py / texts.py   角色自己的措辞与拒绝台词
 │
-├── characters/               角色数据（bind mount，不进镜像更新流程）
-│   ├── characters.toml       28 位角色的名册
-│   ├── sheets/<id>.md        人设（长篇，进 persona 槽）
-│   ├── facts/<id>.md         设定资料（按 SCCORE_RECALL 决定怎么进）
-│   ├── facts/<id>-stories/   剧情原文语料（按话题检索）
-│   ├── facts/<id>-live/      现实演出数据（CSV + README）
-│   ├── world/<id>-qq.md      群聊语域
-│   ├── world/<id>-dm.md      私聊语域
-│   ├── world/<id>-stage.toml 熟悉度档位、称呼、自称
-│   ├── world/<id>-interests.md  插话清单
-│   ├── world/<id>-idols.toml    她认识的同行（三档亲疏）
-│   ├── world/<id>-stories.toml  剧情话题表（53 个话题）
-│   ├── world/<id>-qzone.md      说说写作口径
-│   ├── world/<id>-refusals.toml 拒绝台词
-│   ├── world/office.md / meta.md / idols/  全角色共用知识
-│   └── memory/               自动生成的记忆文件（digest 写入）
+├── characters/               **角色层：仓库只带骨架和示例，内容由部署者准备**
+│   ├── README.md / world/README.md   格式说明
+│   ├── characters.example.toml / units.example.toml / work.example.toml
+│   ├── calendar.toml                 日本祝日表（公开数据，仓库自带）
+│   └── 下面这些**都不在仓库里**，逐项清单见 docs/部署数据清单.md：
+│       characters.toml、packs/<id>/{persona,facts,view,world}.md、
+│       packs/<id>/{names,relations,stories}.toml、
+│       packs/<id>/voice/{qq,dm,qzone,interests}.md、
+│       packs/<id>/voice/{stage,refusals,tiers,night}.toml、
+│       packs/<id>/facts-stories/、assets/、
+│       world/{work,office,meta}.md + world/idols/、works/、units.toml、
+│       gifts.toml、avatars/、backgrounds/、memory/（自动生成）
 │
-├── web/                      SPA：index.html + app.js(200KB) + CSS
-├── tests/                    765 条测试，全离线
-├── tools/                    自检工具（见附录 A）
-└── docs/                     本文与通道包文档
+├── web/                      SPA：index.html + app.js + i18n.js + CSS
+├── tests/                    1037 条测试，全离线
+├── tools/                    check_packs / check_roster / fold_affinity / fake_napcat …
+└── docs/                     architecture.md、部署数据清单.md、qq-channel/
 ```
 
 ### 1.5 一张表看清「谁负责什么」
 
 | 你可能想改的东西 | 该动哪里 | 要重启吗 |
 |---|---|---|
-| 她的性格、口癖 | `characters/sheets/<id>.md` 或 `world/<id>-qq.md` | 不用，下一轮生效 |
-| 群里对陌生人的语气 | `world/<id>-qq.md` 的档位段 | 不用 |
-| 什么情况下她接话 | `world/<id>-interests.md` | 不用 |
-| 她记得的事 | 自动写进 `characters/memory/*.md` | 不用 |
-| 开关某个功能 | `.env`（`QQ_AMBIENT` 等） | 要，`up -d` |
+| 她的性格、口癖 | `characters/packs/<id>/persona.md` | 不用，下一轮生效（persona 槽要 `/重载`） |
+| 群里对陌生人的语气 | `packs/<id>/voice/qq.md` 的档位段 + `voice/tiers.toml` | 不用 |
+| 什么情况下她接话 | `packs/<id>/voice/interests.md` | 不用 |
+| 她记得的事 | 自动写进 `characters/memory/<id>/*.md` | 不用 |
+| 开关某个功能 | 设置页 / `qq_flags`（运行时）；**没拨过**才看 `.env` | 不用，下一轮生效 |
+| 她在 QQ 里演谁 | 设置页 `POST /api/settings/persona`；库里的选择赢过 `.env` | 不用 |
 | 好感度加减规则 | `plugins/affinity.py` 的数量常量 | 要，重建镜像 |
 | 回合流程本身 | `core/turn.py` | 要，重建镜像 |
-| 网页长什么样 | `web/assets/app.js` + CSS | 不用，强刷即可 |
+| 网页长什么样 | `web/assets/app.js` + `i18n.js` + CSS | 不用，强刷即可 |
+
+> 上表里 `characters/packs/...` 全部是**部署者自己准备的文件**，仓库不带。
+> 缺哪份会退成什么，见 [部署数据清单](部署数据清单.md)。
 
 ---
 
@@ -398,6 +400,13 @@ Section(slot=Slot.TURN, text="…", order=10, title="affinity")
 把「对陌生人的语气」写在 turn 槽，人设里 700 行「ふゆ」的营业声线会把它压过去；
 同样的句子放在 persona 槽**最前面**，才真的改变输出。这是量过四档、四档输出几乎一样之后才改的。
 
+**不是回合的场合：QQ 空间。** 发说说 / 回评论没有「对面那个人」、没有历史，
+也不能带 `<ja><zh>` 对话协议，所以**不走 `PromptBuilder.build()`**：
+`core/prompt.persona_text(base)` 只把 `Engine.base` 里的 PERSONA 槽按原顺序拼成一段
+（人设、资料、视角、名字、同行关系都在，但没有房间、没有历史、没有回复格式）。
+`channels/qzone.public_system()` 再按「公开场合提示 → `voice/qzone.md` → 完整人设 → 本次任务」
+拼成一条 system，并明写「两段冲突时以前面的为准」。详见 §4.11。
+
 ### 2.5 判分总线
 
 判分模型（judge）读「制作人刚说了什么」，回答几个小问题：这句话伤到她了吗？
@@ -452,7 +461,7 @@ PRAGMA journal_mode=WAL
 因为加列的标准写法是「表定义里带上新列 + 一条 `ALTER TABLE ADD COLUMN`」，
 后者在新建的库上必然失败，那是正常的。
 
-**21 张表全表**（内核 3 + 插件 11 + 通道 7）：
+**25 张表**（按各模块 `SCHEMA` 去重；下表按模块列主要的）：
 
 | 层 | 表 | 谁写 | 存什么 |
 |---|---|---|---|
@@ -547,7 +556,7 @@ if self.qq is not None:          # 通道最后（它 requires characters, affin
 
 - **钩子**：无（纯 surface）。`capabilities()` 报角色数与默认角色。
 - **接口**：`GET /api/characters`、头像 `GET /media/avatar/<id>`。
-- **数据**：`characters/characters.toml`（28 位）+ `sheets/<id>.md`。
+- **数据**：部署者准备的 `characters/characters.toml`（名册）+ `packs/<id>/persona.md`（人设）；仓库一份角色都不带，见 [部署数据清单](部署数据清单.md)。
 - **关键点**：`sheet` 的**全文进 persona 槽**，所以人设长度直接等于每轮固定成本。
   现网 `fuyuko.md` 是 24KB，属于偏大的（一般角色 8~15KB 合适）。
 - **关掉会怎样**：内核仍能服务「一位角色」，从 `SCCORE_CHARACTERS` 下第一个 `*.md` 读。
@@ -571,7 +580,7 @@ if self.qq is not None:          # 通道最后（它 requires characters, affin
 
 语料 47 个文件、约 1.1MB，**不进提示词**。命中话题才取。
 
-- **三个关键词来源**：手写话题表（`world/<id>-stories.toml`，53 个话题）→ 卡名 → 话名。
+- **三个关键词来源**：手写话题表（`packs/<id>/stories.toml`，按角色一份）→ 卡名 → 话名。
 - **钩子**：`prompt_sections()`（order=25）、`judge_questions()`（`stories.needed`）。
 - **为什么用确定性匹配而不是向量**：误命中的代价不对称。漏了 = 她少说一句细节；
   错命中 = 她讲一段谁也没提的剧情，那在群里立刻穿帮。
@@ -604,14 +613,14 @@ if self.qq is not None:          # 通道最后（它 requires characters, affin
 
 ### 3.6 affinity — 好感度与生闷气 ★
 
-这是最复杂的一个插件（801 行），也是「三种钩子同在一个类里」的样板：
+这是最复杂的一个插件（902 行），也是「三种钩子同在一个类里」的样板：
 判分问题、闸门、提示词、观察者全有。
 
 **数值规则**
 
 ```
 0 ──── 冷淡 ──20── 疏远 ──40── 信任 ──65── 亲近 ──85── 亲密 ── 100
-         ↑ 冷却从 0 开始 ↑ 冷却在 10 结束
+         ↑ 掉到 0 开始冷却 ───── 4 小时后结束（与分数涨没涨回来无关）
 ```
 
 | 常量 | 值 | 含义 |
@@ -619,9 +628,13 @@ if self.qq is not None:          # 通道最后（它 requires characters, affin
 | `NORMAL` | 50 | 网页/私聊的起点，也是静置回升的上限 |
 | `SCCORE_AFFINITY_START` | 20 | **群聊**起点（落在「疏远」，先听到营业声线） |
 | `LEVEL_STEPS` | `-5, -2, 0, +0.5, +1` | 判分 0~4 分别怎么动数字 |
-| `GAINS_PER_DAY` | 6 | 一天最多涨多少（**群聊除外**） |
+| `GAINS_PER_DAY` | 6 | 一天最多涨多少（**群聊除外**：`GAINS_PER_DAY_GROUP=10`） |
 | `RECOVERY_PER_DAY` | 10 | 没人说话时每天回到起点值 |
-| `THAW` | 10 | 冷却结束的位置 |
+| `COOLDOWN_HOURS` | 4 | 冷却最长多久。起点存 `Standing.since`（来自行的 `updated_at`），`cooled_out()` 按时间判 |
+| `THAW` | 10 | 旧的「涨回 10 分才解冻」那条线；现在只在 `recovered()` 里和 `cooled_out()` 一起判，**不再决定何时能说话** |
+
+> 为什么改：从 0 涨回 10 要一整天，而陌生人本来就只有 10 分——一句被判出戏的话
+> 能让她一整天不理人，群里看到的就是「坏了」。四小时后她说话，分数该多少还是多少。
 
 **分表面（这是关键）**
 
@@ -632,6 +645,13 @@ if self.qq is not None:          # 通道最后（它 requires characters, affin
 - 语义上：**五十个人对她的影响和一个人对她的影响是两段关系**，一个数字表达不了。
 - 后果要记住：`GROUP_SURFACE` 是一个桶，**两个群共用一份群聊好感度**。
   想按群分开，得把 key 改成 `group:<room>`（没做）。
+
+**按人物共账（和 surface 正交）**：`Affinity(root=characters.family)` 写库前把
+`character_id` 折算成本体（顺 `derived_from` 往上找，带防环）。所以本体、幼年版、
+if 线**共用一行好感**，换形态不像换了个人；`surface` 三维不变，群聊 / 私聊 / 网页
+仍各算各的。历史数据用
+`python tools/fold_affinity.py --db <库> --characters <角色目录> --apply` 折平
+（不带 `--apply` 只干跑）：谁赢 = 分数最高的那行，不是「本体优先」——合并不能像降级。
 
 **判分 → 数字**
 
@@ -746,7 +766,7 @@ channels/plugin_qq.py::QQService   ← 一个 Plugin，也是唯一有生命周�
   ├ routes()：/api/qq/*、/api/qzone*
   └ migrations()：5 个模块的表一次交上来
         │
-        ├── QQChannel（channels/qq.py，1782 行）  消息判定与回合
+        ├── QQChannel（channels/qq.py，约 3400 行）  消息判定与回合
         │     ├ Presence     语域（三套尺子）
         │     ├ World        三层知识
         │     ├ Interest     插话判断
@@ -852,11 +872,25 @@ if self.config.called and (mentioned or self._named(text)):
 
 `QQ_CALLED=0` 回到旧行为：@ 直接回（只看见那一句），叫名字不算叫。
 
-「叫了她的名字」由 `world/<id>-stage.toml` 的 `names.mentions` 决定，
-**只收那些不会被日常对话带出来的形式**（写「小糸」而不是「糸」）。
+「叫了她的名字」由 `packs/<id>/names.toml` 决定：**`mentions`** 收全名、
+**`cn`** 收中文短名、**`cn_full`** 只给【名字】提示段用。这张表要和
+`packs/<id>/voice/stage.toml` **合并**成一张读（`_stage_table()`）——只读后者时
+名字表整个是空的，说名字不算叫她、【名字】段也在空转。
+`mentions` 只收不会被日常对话带出来的形式；单字短名（透 / 巡）另有一道
+`_says_name()` 守卫：**只在招呼位置算**（「透、在吗」「@透 在吗」算，
+「透明」「透明感」不算），两字以上才允许在句子任意位置命中。
 
 > 踩过的坑：`mentions` 按 `[、,，/\s]+` 切分，所以写「福丸 小糸」会被拆成两个词
 > （等于多认了一个姓）。姓名之间要写全角空格以外的形式，或者只写不带空格的全名。
+
+**@ 与引用（同一批修的）**：
+
+- `Outbox.plain_text()` 只删**她自己**的 at 段，别人的 @ 留成 `@名字`；
+  以前无差别整段删，群里「请客的是 @某某」到了提示词里就少了半句。
+- `reply` 段从 `QUOTE_MEMORY`（`OrderedDict`，最近 200 条）按 `message_id` 还原原句，
+  查不到就照实说「没看到」，不再留下一个空壳。
+- OneBot 回包里的 `message_id` 由 `Outbox._said_id()` 认出来、`keep()` 交回通道存着，
+  所以引用**她自己**说过的话也能对上。
 
 ### 4.5 插话：不掷骰子决定「说什么」
 
@@ -882,7 +916,7 @@ if self.config.called and (mentioned or self._named(text)):
 9. 说了 → 扣一次额度，记日志（第几次、接谁、为什么）
 ```
 
-**同行加权（偶像加成）**：`world/<id>-idols.toml` 里 88 个别名、三档亲疏
+**同行加权（偶像加成）**：`packs/<id>/relations.toml` 里的别名与三档亲疏
 （3 = 自己人，2 = 同事务所，1 = 事务所的人），最长匹配优先
 （「芹沢あさひ」不会被「あさひ」抢掉）。
 
@@ -916,8 +950,9 @@ qq: 看了一眼群里，没接（没什么可接的）
 
 细节：
 
-- `stage` 由 `QQ_IDENTITIES.turns` 的正整数决定，档位和门槛写在
-  `world/<id>-stage.toml` 的 `【阶段 name｜第 N 次开始】` 标题里；主人的下限是 `QQ_OWNER_STAGE`。
+- `stage` 由 `QQ_IDENTITIES.turns` 的正整数决定：**档位阶梯**（`【阶段 name｜N】` 标题）
+  写在 `packs/<id>/voice/qq.md`，`voice/stage.toml` 是各档的措辞表（与 `names.toml`
+  合并成一张读，见 §4.4）；主人的下限是 `QQ_OWNER_STAGE`。
 - `tier` **只在群聊算**（`if not private: tier = self._tier(...)`）。
   私聊完全不读这个值——私聊有自己的语域文件，那里是本性。
 - **主人也不例外**：群聊里他就是群里的一员，数值怎么走就怎么说。
@@ -936,7 +971,7 @@ qq: 看了一眼群里，没接（没什么可接的）
 - **「冬優（ふゆ）」= 面具/营业那一面**：笑眯眯、句尾软、挂♡、有距离。
 - **「冬優子」= 本体**：短句、带刺、「ハ？」「バーカ」。
 - 群聊语域是一条斜线：**越陌生越往「冬優」去**，越熟越能出本体的短句。
-- 这条规则写在 `world/<id>-qq.md`，**不要写进 `affinity.py` 的常量和提示词文本里**——
+- 这条规则写在 `packs/<id>/voice/qq.md`，**不要写进 `affinity.py` 的常量和提示词文本里**——
   换一位角色，那些名字全是错的。
 
 ### 4.7 发送：分段、节流、落队列
@@ -958,6 +993,8 @@ qq: 看了一眼群里，没接（没什么可接的）
   于是在重启循环的机器上，队列被悄悄吃光而一条都没发出去。
 - 私聊目标在 `group_id` 列里用 `dm:` 前缀区分——加一列意味着对线上库做迁移，
   加一个前缀只需要一次 `startswith`。
+- 发送成功后把 OneBot 回包里的 `message_id` 带回来（`_said_id()`），经 `Outbox.keep()`
+  交回通道存进 `QUOTE_MEMORY`；引用还原靠它（§4.4）。
 
 ### 4.8 定时任务族
 
@@ -1082,9 +1119,26 @@ def _sticker_row(self):
 `channels/qzone.py`：她自己的独白，**不是回复任何人**，所以不需要回合那套机械，
 需要的是**日历**和**克制**。
 
-「独白」说的是内容形态（没有人问、没有上文），**不是语气**：空间是公开的，好友、同事、
-半熟的人都刷得到，所以口径按 `characters/world/<id>-qzone.md` 走——写的是公共场合的她
-（ふゆ），不是私下的那个人。私聊的语气（「あんた」「〜わよ」那一侧）在空间里一句都不能出现。
+「独白」说的是内容形态（没有人问、没有上文），**不是语气**：空间是公开的，同事、粉丝、
+不认识的人都刷得到，所以口径按 `characters/packs/<id>/voice/qzone.md` 走——写的是
+公共场合的她，不是私下的那个人。私聊的语气（「あんた」「〜わよ」那一侧）在空间里
+一句都不能出现；**没有这份文件时不发说说**，不退回通用文案。
+
+**她仍然是完整的一个人（3.1.0）**：system 由 `public_system()` 拼成一条，
+顺序就是优先级——
+
+```
+【公开场合 · 这一段的优先级最高】   ← 明写「两段冲突时以前面的为准」
+《空间里的她》= voice/qzone.md      ← 这个场合的样子
+# 你是谁（完整人设）                ← persona_text(Engine.base)：人设 / 资料 / 视角 / 名字 / 同行
+## 这一次 + 日期 + 最近 3 条 + 任务 ← 最后，最鲜
+```
+
+完整人设**每次现场取**（`persona_base=lambda: app.engines[id].base`），不缓存——
+人设热更或换过角色后，缓存住的就是上一个人的声音。读不到时只按写作口径写，
+不让一条说说因为人设缺件卡住。评论回复用同一套（`PUBLIC_REPLY_HEAD`，§4.11.1）。
+两段都不走 `Engine.build()`：那边会带上 `<ja><zh>` 协议、房间和「对面那位制作人」，
+在公开场合全是错的（§2.4）。
 
 **接口事实**（NapCat 扩展，不在 OneBot 11 里）：
 
@@ -1102,7 +1156,7 @@ delete_qzone_msg {tid}
 **发不发的判定（`maybe()`）**：
 
 ```
-QQ_QZONE=1 且 有人设文件 world/<id>-qzone.md（没有就拒发）
+QQ_QZONE=1 且 有 packs/<id>/voice/qzone.md（没有就拒发）
 → 过了 QQ_QZONE_HOUR（默认 21:00，按 SCCORE_TIMEZONE）
 → 今天没发过（qzone:day）
 → 距上一条 ≥ QQ_QZONE_GAP（20 小时）
@@ -1255,7 +1309,7 @@ content   = @{uin:<被回复的人>,nick:<昵称>,auto:1} 正文
 | `world.py` | 三层知识 | `office.md`（每人一行，每轮进缓存）→ `idols/<id>.md`（提到才进）→ `meta.md`（问到才进） |
 | `digest.py` | 记忆文件 | 整份重写不是追加；水位记 `last_seq`；<4 条新消息不动；写到卷上而非镜像里 |
 | `identities.py` | QQ 号 ↔ 内核用户 | `resolve()` 建用户；`turns` 计数；`loving` 标记只增不减 |
-| `texts.py` | 拒绝台词 | 键是稳定的（`quota.turns`），话是角色的（`world/<id>-refusals.toml`） |
+| `texts.py` | 拒绝台词 | 键是稳定的（`quota.turns`），话是角色的（`packs/<id>/voice/refusals.toml`） |
 | `stage.py` | 角色自己的措辞 | 扁平键值；缺键=默认，空值=默认，读不了=默认 |
 
 **`digest.py` 的一个权限坑**：容器里跑的是 uid 10001，宿主机上 `characters/memory/` 必须是它可写的：
@@ -1429,6 +1483,18 @@ python serve.py                           # 读 ./.env，再读环境变量
 - [ ] 一个 OpenAI 兼容服务的 `base_url` / `api_key` / `model`
 - [ ] 一个 **QQ 小号**（机器人本体），能和主号加好友
 - [ ] 一个群（先拉小号进群，不需要给管理员）
+- [ ] **角色数据**——这是最容易漏的一项：仓库里一位角色都没有
+- [ ] 按 [部署数据清单](部署数据清单.md) 补齐 `characters.toml` 与
+      `characters/packs/<id>/` 下的 `persona.md`、`voice/qq.md`、`voice/dm.md`
+
+```bash
+# 放好角色数据后先自检，别等到「她说话像通用助手」才回头查
+python tools/check_packs.py            # 包结构：必需项、继承、TOML 解析
+python tools/check_roster.py           # 名册字段：有没有漏、有没有自相矛盾
+```
+
+只补了 `.env` 没补角色，服务照样能起、接口照样能通——**能跑 ≠ 演对了**。
+缺哪份文件会退成什么，逐项写在 [部署数据清单](部署数据清单.md) 第 1 节。
 
 ### 第 1 步：装 Docker
 
@@ -1487,11 +1553,14 @@ vi .env
 
 ```
 QQ_ENABLED=1
-QQ_CHARACTER=fuyuko          # characters.toml 里的 id，决定用哪份人格
+QQ_CHARACTER=<你的角色 id>  # 你自己 characters.toml 里的 id；仓库不带任何角色
 QQ_OWNER_IDS=<你的主号>
 QQ_PRIVATE=0                 # 先关私聊，群里跑通再说
-SCCORE_RECALL=whole          # 有 facts 文件就用整份
+SCCORE_RECALL=whole          # 包里有 facts.md 时用整份
 ```
+
+`QQ_CHARACTER` 也可以在网页「设置」里改（`POST /api/settings/persona`）：
+**库里的选择赢过 `.env`**，重启后仍然是那一位。
 
 ### 第 4 步：起容器
 
@@ -1504,7 +1573,7 @@ docker compose logs -f scbot
 **成功的日志长这样**（顺序有意义）：
 
 ```
-scbot-new  ←  http://0.0.0.0:8100 （28 位角色 / characters, recall, stories, quota, photos, affinity, memory, profile, voice, status, gifts, qq / <model>）
+scbot-new  ←  http://0.0.0.0:8100 （部署者准备的角色 / characters, recall, stories, quota, photos, affinity, memory, profile, voice, status, gifts, qq / <model>）
 QQ 通道已启动：群 123456789 / 角色 fuyuko / ws://napcat:3001
 qq: 周一 9:00 之后发一张「上班」表情到 123456789（表情包里标了「上班」的有 1 张）
 onebot: connected
@@ -1629,6 +1698,13 @@ python3 serve.py --fake --port 8100
 
 分五组。**默认值就是「安全的那一侧」**（关、低频、只认名单里的人）——
 聊天机器人的失败模式是「不小心被打开」。
+
+> **开关有两层，别只改 `.env`。** 网页「设置 → 插件」拨过的开关存在 `qq_flags`
+> （`channels/flags.py` 统一读写），**优先于 `.env`**；只有「没拨过」才回落环境变量。
+> `Flags.get()` 缺值返回 `None`、而不是 `""`，就是为了分得开「没拨过」和「拨成 0」。
+> 当前在演谁也一样：`qq_flags` 里的 `qq_idol` / `persona:<偶像>` 赢过 `QQ_CHARACTER`。
+> 还有一组作息开关 `QQ_SLEEP=0` 能整套关掉睡眠账本（角色包里的 `voice/night.toml`
+> 才是「她几点睡」的正式位置，见 `docs/qq-channel/04-自定义角色.md`）。
 
 ### 9.1 模型与内核
 
@@ -1808,7 +1884,7 @@ docker logs scbot --tail 50 | grep 空间
 
 | 日志 | 含义 |
 |---|---|
-| `写不出来（…）` | 模型没给出合格内容；或者缺 `world/<id>-qzone.md` |
+| `写不出来（…）` | 模型没给出合格内容；或者缺 `packs/<id>/voice/qzone.md` |
 | `这一条不通过（…）` | 内容闸拦了（太长/短、数字、链接、@、破功词、重复） |
 | `空间这一轮出错（…）` | 异常；`unsupported` 会记 24 小时不再试 |
 | 接口返回 `"why": "空间功能没开（QQ_QZONE=0）"` | 开关没开；**手动路径也受开关管** |
@@ -1838,10 +1914,10 @@ ls -la characters/memory/
 
 | 改的是哪 | 生效方式 |
 |---|---|
-| `world/*.md`、`-interests.md`、`-stage.toml` | 下一轮自动生效（`live.py`，文件要安静 0.35 秒） |
-| `facts/<id>.md` | 它在 persona 槽、被 Engine 缓存 → `/重载` 或重启容器 |
-| `sheets/<id>.md` | 同上 |
+| `packs/<id>/voice/{qq,dm,qzone,interests}.md`、`voice/*.toml` | 下一轮自动生效（`live.py`，文件要安静 0.35 秒） |
+| `packs/<id>/{persona,facts,view,world}.md`、`names.toml` | 它们进 persona 槽、被 Engine 缓存 → `/重载` 或重启容器 |
 | `characters.toml` 增删角色 | `App.refresh()` 会重建 Engine；新头像文件要重启 |
+| `.env` 里的开关 | 要重启；若网页设置页拨过同一个开关，改 `.env` **不会生效**（库赢） |
 | 代码 | 重建镜像：`docker compose up -d --build` |
 
 `/重载` 返回 `{"dropped": …, "sheet": true, "generation": …}`，`dropped` 是被丢掉的提示词缓存数。
@@ -1879,6 +1955,10 @@ compose 里已经有 `security_opt: apparmor=unconfined`，`napcat` 还有 `secc
 
 ### 11.1 数据与卷
 
+- **仓库不含角色数据，能起服务不等于部署好了。** `characters/` 下只有 README、
+  示例 TOML 和公开祝日表；名册、人设、语域、立绘全部要部署者自己准备。逐项清单见
+  [部署数据清单](部署数据清单.md)。少一份文件不会报错，只会静默退回中性表现——
+  所以「她怎么像个通用助手」先去查文件在不在，而不是先改代码。
 - **`characters/` 是 bind mount，不是镜像内容。** 改人设不用重建镜像；重建镜像也只会把
   镜像里那份旧文本再盖回来一次（挂载点仍然覆盖）。这是两件事，不要混。
 - **`docker compose down -v` 删卷**：数据库、图片、表情包、记忆全没。改配置不需要它。
@@ -1970,7 +2050,7 @@ PYTHONPATH=. python -m unittest discover -s tests -t .          # 全部
 PYTHONPATH=. python -m unittest tests.test_channels -v          # 单个模块
 ```
 
-**765 条，全离线**：模型是脚本化的（`ScriptedLLM`）、OneBot 是假的、时钟是注入的、
+**1037 条，全离线**：模型是脚本化的（`ScriptedLLM`）、OneBot 是假的、时钟是注入的、
 文件写在临时目录。所以它可以在任何机器上跑，不花钱、不联网、不发消息。
 
 | 文件 | 条数 | 覆盖 |
@@ -1998,7 +2078,10 @@ def test_an_empty_collection_still_falls_back_to_the_pack(self):
 | `tools/fake_napcat.py` | 假 NapCat：自动 @ 她，打印回包段类型。**改通道后的第一道回归** |
 | `tools/pack_channel.py` | 把 `channels/` 打成一个可独立交付的插件包（含禁用词检查） |
 | `tools/check_classes.py` | 查前端用到的 Tailwind 类在 CSS 产物里真的存在（防静默失效） |
-| `tools/crosscheck.py` | 交叉校验：作息表 ↔ 独立实现、祝日 ↔ 内阁府 CSV、共享事实 ↔ 各角色视角、北京日界 ↔ 东京作息、记忆分区、判官措辞、角色包解析。**单测问「按我以为的做吗」，它问「两处各自对的东西放到一起还对吗」**；`--offline` 跳过联网那一节 |
+| `tools/check_packs.py` | **补完角色数据先跑它**：包的必需项、继承关系、`night.toml`、所有 TOML 解析 |
+| `tools/check_roster.py` | 名册字段自检：有没有漏、合不合法、自相矛盾 |
+| `tools/fold_affinity.py` | 把旧的好感行折成「一个人一本」；不带 `--apply` 只干跑 |
+| `tools/crosscheck.py` | 本机留用的交叉校验脚本（按某台部署的角色写死，**不在仓库里**） |
 | `demo.py` | 命令行里跑一轮，不启服务 |
 
 ### A.3 改代码后最小验证流程
@@ -2007,7 +2090,7 @@ def test_an_empty_collection_still_falls_back_to_the_pack(self):
 # 1. 语法 / 导入
 python -c "import app, channels.plugin_qq"
 
-# 2. 全量测试（约 35 秒）
+# 2. 全量测试（约 70 秒）
 PYTHONPATH=. python -m unittest discover -s tests -t .
 
 # 3. 前端（改过 web/ 才需要）
